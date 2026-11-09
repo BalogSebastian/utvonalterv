@@ -28,12 +28,14 @@ const frac = (n: number) => {
   const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
   return x - Math.floor(x);
 };
+// 2 tizedesre kerekítve: a szerver és a kliens azonos stringet rendereljen (hydration-biztos)
+const r2 = (n: number) => Math.round(n * 100) / 100;
 const STARS = Array.from({ length: 90 }, (_, i) => ({
-  left: frac(i + 1) * 100,
-  top: frac(i + 91) * 100,
+  left: r2(frac(i + 1) * 100),
+  top: r2(frac(i + 91) * 100),
   size: 1 + Math.floor(frac(i + 181) * 3),
-  delay: frac(i + 271) * 4,
-  dur: 2 + frac(i + 361) * 3,
+  delay: r2(frac(i + 271) * 4),
+  dur: r2(2 + frac(i + 361) * 3),
 }));
 
 const STATUS = [
@@ -114,7 +116,7 @@ export default function Splash() {
       <div className="splash-glow splash-glow-2" />
       <div className="splash-stars" aria-hidden>
         {STARS.map((s, i) => (
-          <i key={i} style={{ left: `${s.left}%`, top: `${s.top}%`, width: s.size, height: s.size, animationDelay: `${s.delay}s`, animationDuration: `${s.dur}s` }} />
+          <i key={i} style={{ left: `${s.left}%`, top: `${s.top}%`, width: `${s.size}px`, height: `${s.size}px`, animationDelay: `${s.delay}s`, animationDuration: `${s.dur}s` }} />
         ))}
       </div>
 
