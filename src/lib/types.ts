@@ -81,6 +81,19 @@ export interface TollBreakdownItem {
   asOf: string;
 }
 
+export interface SpecialItem {
+  id: string;
+  name: string;
+  country: string;
+  km: number;
+  /** EUR; 0 ha a díj nincs bekalkulálva */
+  fee: number;
+  modelled: boolean;
+  note: string;
+  confidence: "source" | "estimate";
+  asOf: string;
+}
+
 export interface TripStop {
   id: string;
   anchored?: boolean;
@@ -121,6 +134,9 @@ export interface RouteResult {
   countries: CountryLeg[];
   tollBreakdown: TollBreakdownItem[];
   tollTotalEur: number;
+  /** alagút-/szakaszdíjak (benne vannak a tollTotalEur-ban, ha modelled) */
+  specials: SpecialItem[];
+  specialsTotalEur: number;
   fuelLiters: number;
   fuelCostEur: number;
   driverCostEur: number;

@@ -2,11 +2,12 @@ import { COUNTRY_NAMES, countryAt } from "./countries";
 import { banWarnings } from "./bans";
 import { decodePolyline, encodePolyline } from "./polyline";
 import { TOLL_RULES, fixedFee, isTolledEdge, ratePerKm } from "./tolls";
+import { SPECIALS, specialFee } from "./specials";
 import {
   routeRequest, traceEdges, type VEdge, type VLeg, type VTrip,
 } from "./valhalla";
 import type {
-  CountryLeg, DriveSchedule, LngLat, RouteRequest, RouteResult, TollBreakdownItem, TripStop,
+  CountryLeg, DriveSchedule, LngLat, RouteRequest, RouteResult, TollBreakdownItem, TripStop, SpecialItem,
 } from "./types";
 
 interface EdgeLike {
@@ -14,6 +15,7 @@ interface EdgeLike {
   toll: boolean;
   roadClass?: string;
   name?: string;
+  names?: string[];
   a: LngLat;
   b: LngLat;
   /** index range a geometria pontjaiban (tollGeometry-hez) */
@@ -119,7 +121,7 @@ async function legEdges(
       const sh = decodePolyline(t.value.shape);
       for (const e of t.value.edges) {
         edges.push({
-          km: e.length, toll: !!e.toll, roadClass: e.road_class, name: e.names?.[0],
+          km: e.length, toll: !!e.toll, roadClass: e.road_class, name: e.names?.[0], names: e.names,
           a: sh[e.begin_shape_index], b: sh[e.end_shape_index],
           i0: c.from + e.begin_shape_index, i1: c.from + e.end_shape_index,
         });
@@ -166,10 +168,14 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
 
   const perCountry = new Map<string, { km: number; tollKm: number }>();
   const roadKm = new Map<string, Map<string, number>>();
+  const specialKm = new Map<string, number>();
   for (const e of edges) {
     const mid: LngLat = [(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2];
     const cc = countryAt(mid) ?? countryAt(e.a) ?? curCountry;
     curCountry = cc;
+    if (e.names?.length) {
+      for (const sp of SPECIALS) if (sp.test(e.names, cc)) specialKm.set(sp.id, (specialKm.get(sp.id) ?? 0) + e.km);
+    }
     const rule = TOLL_RULES[cc];
     const tolled = rule ? isTolledEdge(rule, e.roadClass, e.toll) : false;
     let last = visits[visits.length - 1];
@@ -237,7 +243,15 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
       asOf: rule.asOf,
     });
   }
-  const tollTotalEur = tollBreakdown.reduce((s, t) => s + t.total, 0);
+  const specials: SpecialItem[] = [];
+  for (const sp of SPECIALS) {
+    const km = specialKm.get(sp.id) ?? 0;
+    if (km < sp.minKm) continue;
+    const fee = specialFee(sp, v);
+    specials.push({ id: sp.id, name: sp.name, country: sp.country, km, fee, modelled: !!sp.fees, note: sp.note, confidence: sp.confidence, asOf: sp.asOf });
+  }
+  const specialsTotalEur = specials.reduce((s, x) => s + x.fee, 0);
+  const tollTotalEur = tollBreakdown.reduce((s, t) => s + t.total, 0) + specialsTotalEur;
 
   // --- idő, szünetek ---
   // Menetidő: kamionos átlagsebességek útosztályonként (a routingot nem torzítjuk sebességkorláttal,
@@ -323,6 +337,8 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     countries,
     tollBreakdown,
     tollTotalEur,
+    specials,
+    specialsTotalEur,
     fuelLiters,
     fuelCostEur,
     driverCostEur,

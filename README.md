@@ -47,7 +47,7 @@ A `docker-compose.yml` a teljes európai Geofabrik-kivonatot tölti le (nagy: ki
 ## ⚠️ Fontos: az adatok pontossága
 
 - **Az útdíj-tarifák megbízhatósága országonként eltér**, a felületen jelölve (*forrás szerint* / *becslés*). 2026-os, nyilvános másodlagos forrásból megerősítve: DE (34,8 ct/km), AT (57,24 ct/km), HU (J4 ~163 Ft/km), PL (0,56 zł/km), CH. Becslés: CZ, SK, RO (új TollRo, bizonytalan), HR, SI, IT, FR, ES, PT, BG, BE. Hivatalos táblából egyik sincs ellenőrizve (`verified: false`). A tarifák a [`src/lib/tolls.ts`](src/lib/tolls.ts) fájlban egy helyen szerkeszthetők – éles használat előtt vesd össze a hivatalos rendszerekkel (Toll Collect, GO-Maut, HU-GO, emyto, Mýto, e-TOLL, stb.).
-- Nincsenek modellezve: alagút-, híd- és hegyiszakasz-felárak (Brenner, Mont-Blanc, Duna-hidak…), DE CO₂-osztályok részletei, NL/DK/SE útdíjak.
+- Alagút- és szakaszdíjak (`src/lib/specials.ts`): modellezve a Fréjus, a Mont Blanc és a Brenner (A13); a Gran San Bernardo, Tauern/Katschberg, Arlberg, Karawanken, Gleinalm/Bosruck, Øresund és Storebælt csak figyelmeztetés (a díj nincs bekalkulálva). Duna-hidak, Eurotunnel, NL/DK/SE útdíjak, DE CO₂-osztályok részletei nincsenek modellezve.
 - A díjköteles útosztályokat az OSM `road_class` / `toll=yes` adatokból becsüli, ez a valóságtól eltérhet.
 - A tilalmi idősávok (`src/lib/bans.ts`) tájékoztatók; **ünnepnapokat, nyári és helyi tilalmakat nem tartalmaznak.**
 - A menetidő a Valhalla becslésén (90 km/h csúcssebesség) alapul.

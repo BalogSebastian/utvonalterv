@@ -30,6 +30,7 @@ export interface VEdge {
   speed_limit?: number;
   use?: string;
   names?: string[];
+  tunnel?: boolean;
 }
 
 export class ValhallaError extends Error {
@@ -116,6 +117,7 @@ export async function traceEdges(
         "edge.road_class",
         "edge.use",
         "edge.names",
+        "edge.tunnel",
         "edge.begin_shape_index",
         "edge.end_shape_index",
       ],

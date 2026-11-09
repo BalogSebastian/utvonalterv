@@ -182,8 +182,22 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
             </tbody>
           </table>
         </div>
+        {r.specials.length > 0 && (
+          <div className="mt-3 space-y-2">
+            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">Alagút- és szakaszdíjak</h4>
+            {r.specials.map((sp) => (
+              <div key={sp.id} className={`rounded-lg border px-3 py-2 text-sm ${sp.modelled ? "border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30" : "border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/60"}`}>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="font-medium">🚇 {sp.name}</span>
+                  <span className="font-bold tabular-nums">{sp.modelled ? eur2(sp.fee) : "nincs bekalkulálva"}</span>
+                </div>
+                <div className="mt-0.5 text-xs text-slate-600 dark:text-slate-400">{sp.note}</div>
+              </div>
+            ))}
+          </div>
+        )}
         <p className="mt-1.5 text-xs text-slate-500">
-          <b>Forrás szerint</b>: 2026-os, nyilvános (másodlagos) forrásból ellenőrzött tarifa; <b>becslés</b>: nincs megbízható forrás. Egérrel a sorra állva a részletek láthatók. A tarifák a <code>src/lib/tolls.ts</code> fájlban frissíthetők. Alagút-, híd- és szakaszfelárak nincsenek benne.
+          <b>Forrás szerint</b>: 2026-os, nyilvános (másodlagos) forrásból ellenőrzött tarifa; <b>becslés</b>: nincs megbízható forrás. Egérrel a sorra állva a részletek láthatók. A tarifák a <code>src/lib/tolls.ts</code> fájlban frissíthetők. A felismert alagút-/szakaszdíjak külön szerepelnek (az útdíj összegben benne vannak).
           {r.tollAccuracy === "maneuver" && " ⚠ Ennél az útnál a díjköteles szakaszok pontossága csökkent (a részletes úthálózati adat nem volt elérhető)."}
         </p>
       </section>
