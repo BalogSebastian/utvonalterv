@@ -123,7 +123,7 @@ export default function Splash() {
       {/* világító útvonalhálózat */}
       <svg className="splash-net" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice" aria-hidden>
         <defs>
-          <linearGradient id="rg" x1="0" y1="0" x2="1" y2="0">
+          <linearGradient id="rg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1600" y2="0">
             <stop offset="0" stopColor="#38bdf8" />
             <stop offset="0.55" stopColor="#818cf8" />
             <stop offset="1" stopColor="#fbbf24" />
@@ -131,14 +131,15 @@ export default function Splash() {
         </defs>
         {ROUTES.map((d, i) => (
           <g key={i} style={{ ["--d" as string]: `${0.25 + i * 0.28}s` }}>
-            <path className="net-glow" d={d} pathLength={1} />
-            <path className="net-line" d={d} pathLength={1} />
-            <path className="net-pulse" d={d} pathLength={1} />
+            <path className="net-glow" d={d} stroke="url(#rg)" />
+            <path className="net-line" d={d} stroke="url(#rg)" />
+            <path className="net-pulse" d={d} stroke="#ffffff" />
           </g>
         ))}
         {NODES.map(([x, y, t], i) => (
           <g key={i} className="net-node" style={{ ["--t" as string]: `${t}s` }} transform={`translate(${x} ${y})`}>
             <circle className="net-ring" r="10" />
+            <circle className="net-halo" r="11" />
             <circle className="net-dot" r="5" />
           </g>
         ))}
@@ -158,7 +159,7 @@ export default function Splash() {
               </linearGradient>
             </defs>
             <rect x="2" y="2" width="60" height="60" rx="16" fill="#0f1f3d" stroke="url(#sg)" strokeWidth="2" />
-            <path className="splash-path" d="M14 44c8-2 8-16 17-16s9 12 19 8" stroke="url(#sg)" strokeWidth="4" strokeLinecap="round" pathLength={1} />
+            <path className="splash-path" d="M14 44c8-2 8-16 17-16s9 12 19 8" stroke="url(#sg)" strokeWidth="4" strokeLinecap="round" />
             <circle className="splash-dot s" cx="14" cy="44" r="4.5" fill="#34d399" />
             <circle className="splash-dot e" cx="50" cy="36" r="4.5" fill="#f43f5e" />
           </svg>
