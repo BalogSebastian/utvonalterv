@@ -1,0 +1,18 @@
+# Saját, ingyenes Valhalla routing szerver (OSM-adatokból).
+# Használat: docker compose up -d   →   VALHALLA_URL=http://localhost:8002
+services:
+  valhalla:
+    image: ghcr.io/valhalla/valhalla-scripted:latest
+    container_name: valhalla
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./valhalla_data:/custom_files
+    environment:
+      - tile_urls=https://download.geofabrik.de/europe-latest.osm.pbf
+      - use_tiles_ignore_pbf=True
+      - force_rebuild=False
+      - build_elevation=False
+      - build_admins=True
+      - build_time_zones=True
+      - server_threads=4

@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0b1120;
+    --foreground: #e2e8f0;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@utility btn {
+  @apply rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:opacity-40 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700;
+}
+@utility field {
+  @apply rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800;
+}
+@utility lbl {
+  @apply block text-xs font-medium text-slate-500 dark:text-slate-400;
+  & > .field,
+  & > input,
+  & > select {
+    @apply mt-1 text-slate-900 dark:text-slate-100;
+  }
+}
+@utility sec {
+  @apply text-xs font-bold uppercase tracking-wider text-slate-500;
+}
+
+.maplibregl-popup-content {
+  color: #0f172a;
+}
+
+@media print {
+  aside {
+    width: 100% !important;
+    height: auto !important;
+  }
+  main {
+    display: none !important;
+  }
+}
