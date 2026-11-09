@@ -5,6 +5,7 @@ import * as maplibregl from "maplibre-gl";
 import type { GeoJSONSource, Map as MLMap, Marker } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { RouteResult, Vehicle, Waypoint } from "@/lib/types";
+import { cumulative, snapToRoute } from "@/lib/schedule";
 
 // A worker a public/ mappából jön (a Turbopack nem tudja automatikusan becsomagolni).
 maplibregl.setWorkerUrl("/maplibre-gl-worker.mjs");
@@ -20,6 +21,8 @@ interface Props {
   pickMode: number | null;
   onPick: (lat: number, lon: number) => void;
   onSelectRoute: (i: number) => void;
+  onStopMove: (id: string, f: number) => void;
+  onWaypointDrag: (i: number, lat: number, lon: number) => void;
 }
 
 const EMPTY: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
@@ -49,7 +52,7 @@ function supportsWebGL2(): boolean {
 }
 
 export default function MapView({
-  waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute,
+  waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onWaypointDrag,
 }: Props) {
   const [glOk] = useState(supportsWebGL2);
   const el = useRef<HTMLDivElement>(null);
@@ -63,11 +66,15 @@ export default function MapView({
   const rawRestr = useRef<GeoJSON.FeatureCollection>(EMPTY);
   const pickRef = useRef({ pickMode, onPick });
   const selectRef = useRef(onSelectRoute);
+  const stopMoveRef = useRef(onStopMove);
+  const wpDragRef = useRef(onWaypointDrag);
   const vehicleRef = useRef(vehicle);
 
   useEffect(() => {
     pickRef.current = { pickMode, onPick };
     selectRef.current = onSelectRoute;
+    stopMoveRef.current = onStopMove;
+    wpDragRef.current = onWaypointDrag;
     vehicleRef.current = vehicle;
   });
 
@@ -171,7 +178,14 @@ export default function MapView({
       const d = document.createElement("div");
       d.textContent = first ? "A" : last ? "B" : String(i);
       d.style.cssText = `width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font:700 13px system-ui;color:#fff;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.45);background:${first ? "#16a34a" : last ? "#dc2626" : "#475569"}`;
-      markers.current.push(new maplibregl.Marker({ element: d }).setLngLat([w.lon, w.lat]).addTo(map));
+      d.style.cursor = "grab";
+      d.title = "Húzd az áthelyezéshez (új útvonalat számol)";
+      const mk = new maplibregl.Marker({ element: d, draggable: true }).setLngLat([w.lon, w.lat]).addTo(map);
+      mk.on("dragend", () => {
+        const ll = mk.getLngLat();
+        wpDragRef.current(i, ll.lat, ll.lng);
+      });
+      markers.current.push(mk);
     });
     if (placed.length === 1 && routes.length === 0) map.easeTo({ center: [placed[0].w.lon, placed[0].w.lat], zoom: Math.max(map.getZoom(), 9) });
   }, [waypoints, ready, routes.length]);
@@ -207,12 +221,25 @@ export default function MapView({
     if (!map || !ready) return;
     stopMarkers.current.forEach((m) => m.remove());
     stopMarkers.current = [];
-    for (const st of routes[selected]?.stops ?? []) {
+    const route = routes[selected];
+    if (!route) return;
+    const cum = cumulative(route.geometry);
+    for (const st of route.stops) {
       const d = document.createElement("div");
       d.textContent = st.kind === "rest" ? "🌙" : "☕";
-      d.title = `${st.kind === "rest" ? "Napi pihenő" : "45 perc szünet"} – ${st.day}. nap, ~${Math.round(st.km)}. km`;
-      d.style.cssText = "font-size:15px;width:26px;height:26px;border-radius:50%;background:#fff;border:2px solid #334155;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,.4)";
-      stopMarkers.current.push(new maplibregl.Marker({ element: d }).setLngLat([st.lon, st.lat]).addTo(map));
+      d.title = `${st.kind === "rest" ? "Napi pihenő" : "45 perc szünet"} – ${st.day}. nap, ~${Math.round(st.km)}. km – húzd az útvonal mentén`;
+      d.style.cssText = `font-size:15px;width:28px;height:28px;border-radius:50%;background:#fff;border:2px solid ${st.warn ? "#dc2626" : "#334155"};display:flex;align-items:center;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,.45);cursor:grab`;
+      const mk = new maplibregl.Marker({ element: d, draggable: true }).setLngLat([st.lon, st.lat]).addTo(map);
+      // húzás közben az útvonalhoz "tapad"
+      mk.on("drag", () => {
+        const ll = mk.getLngLat();
+        mk.setLngLat(snapToRoute(route.geometry, cum, [ll.lng, ll.lat]).point);
+      });
+      mk.on("dragend", () => {
+        const ll = mk.getLngLat();
+        stopMoveRef.current(st.id, snapToRoute(route.geometry, cum, [ll.lng, ll.lat]).f);
+      });
+      stopMarkers.current.push(mk);
     }
   }, [routes, selected, ready]);
 

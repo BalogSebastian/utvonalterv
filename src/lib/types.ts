@@ -54,6 +54,7 @@ export interface TollSegment {
 
 export interface CountryLeg {
   country: string;
+  startKm: number;
   km: number;
   tollKm: number;
   toll: number;
@@ -81,6 +82,11 @@ export interface TollBreakdownItem {
 }
 
 export interface TripStop {
+  id: string;
+  /** a menetrend-szabály megsértése ennél a megállónál */
+  warn?: string;
+  /** az útvonal mentén megtett arány 0..1 */
+  f: number;
   kind: "break" | "rest";
   /** vezetés kezdete óta, óra */
   atH: number;

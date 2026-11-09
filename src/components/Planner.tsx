@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Results from "./Results";
 import WaypointInput from "./WaypointInput";
+import { addStop, applyPlan, defaultStops, type PlanStop } from "@/lib/schedule";
 import { DEFAULT_COSTS, VEHICLE_PRESETS } from "@/lib/presets";
 import type { CostInputs, EuroClass, RouteOptions, RouteResult, Vehicle, Waypoint } from "@/lib/types";
 
@@ -58,7 +59,8 @@ export default function Planner() {
   const [showParking, setShowParking] = useState(false);
   const [copied, setCopied] = useState(false);
   const autoRan = useRef(false);
-  const [routes, setRoutes] = useState<RouteResult[]>([]);
+  const [rawRoutes, setRoutes] = useState<RouteResult[]>([]);
+  const [plans, setPlans] = useState<Record<number, PlanStop[]>>({});
   const [selected, setSelected] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -88,27 +90,29 @@ export default function Planner() {
 
   const ready = waypoints.every(Boolean);
 
-  const calc = async () => {
-    if (!ready) return;
+  const calc = async (wpsIn: (Waypoint | null)[] = waypoints) => {
+    if (!wpsIn.every(Boolean)) return;
     setLoading(true);
     setError(null);
     try {
       const res = await fetch("/api/route", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ waypoints, vehicle, costs, options }),
+        body: JSON.stringify({ waypoints: wpsIn, vehicle, costs, options }),
       });
       const j = await res.json();
       if (!res.ok) throw new Error(j.error ?? "Ismeretlen hiba");
       setRoutes(j.routes);
+      setPlans({});
       setSelected(0);
-      const wps = waypoints as Waypoint[];
+      const wps = wpsIn as Waypoint[];
       const entry: Recent = { label: `${shortLabel(wps[0].label)} → ${shortLabel(wps[wps.length - 1].label)}`, waypoints: wps };
       const next = [entry, ...recent.filter((r) => r.label !== entry.label)].slice(0, 5);
       setRecent(next);
       try { localStorage.setItem(RECENT, JSON.stringify(next)); } catch { /* privát mód */ }
     } catch (e) {
       setRoutes([]);
+      setPlans({});
       setError((e as Error).message);
     } finally {
       setLoading(false);
@@ -146,6 +150,29 @@ export default function Planner() {
       if (label) setWaypoints((ws) => ws.map((x) => (x && x.lat === lat && x.lon === lon ? { ...x, label } : x)));
     } catch { /* marad a koordináta */ }
   }, []);
+
+  const routes = useMemo(
+    () => rawRoutes.map((r, i) => applyPlan(r, plans[i] ?? defaultStops(r), options.departure, vehicle.weight, costs.driverHourly)),
+    [rawRoutes, plans, options.departure, vehicle.weight, costs.driverHourly],
+  );
+  const currentPlan = (): PlanStop[] => plans[selected] ?? (rawRoutes[selected] ? defaultStops(rawRoutes[selected]) : []);
+  const setPlan = (p: PlanStop[]) => setPlans((all) => ({ ...all, [selected]: p }));
+  const onStopMove = (id: string, f: number) => setPlan(currentPlan().map((x) => (x.id === id ? { ...x, f } : x)));
+  const onAddStop = (kind: "break" | "rest") => setPlan(addStop(currentPlan(), kind));
+  const onRemoveStop = (id: string) => setPlan(currentPlan().filter((x) => x.id !== id));
+  const onResetStops = () => setPlans((all) => { const c = { ...all }; delete c[selected]; return c; });
+
+  const onWaypointDrag = async (i: number, lat: number, lon: number) => {
+    const moved = waypoints.map((x, j) => (j === i ? { lat, lon, label: `${lat.toFixed(5)}, ${lon.toFixed(5)}` } : x));
+    setWaypoints(moved);
+    void calc(moved);
+    try {
+      const r = await fetch(`/api/geocode?lat=${lat}&lon=${lon}`);
+      const j = await r.json();
+      const label = j.results?.[0]?.label;
+      if (label) setWaypoints((ws) => ws.map((x, k) => (k === i && x?.lat === lat ? { ...x, label } : x)));
+    } catch { /* marad a koordináta */ }
+  };
 
   const presetId = useMemo(
     () => VEHICLE_PRESETS.find((p) => JSON.stringify(p.v) === JSON.stringify(vehicle))?.id ?? "custom",
@@ -260,7 +287,7 @@ export default function Planner() {
           </details>
 
           <button
-            onClick={calc}
+            onClick={() => calc()}
             disabled={!ready || loading}
             className="w-full rounded-xl bg-blue-600 py-3 font-semibold text-white shadow transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -272,7 +299,7 @@ export default function Planner() {
           {routes.length > 0 && (
             <>
               <button className="btn w-full" onClick={share}>{copied ? "✓ Link a vágólapon" : "🔗 Megosztható link másolása"}</button>
-              <Results routes={routes} selected={selected} onSelect={setSelected} costs={costs} />
+              <Results routes={routes} selected={selected} onSelect={setSelected} costs={costs} onAddStop={onAddStop} onRemoveStop={onRemoveStop} onResetStops={onResetStops} edited={!!plans[selected]} />
             </>
           )}
 
@@ -295,6 +322,8 @@ export default function Planner() {
           pickMode={pickIdx}
           onPick={onPick}
           onSelectRoute={setSelected}
+          onStopMove={onStopMove}
+          onWaypointDrag={onWaypointDrag}
         />
       </main>
     </div>

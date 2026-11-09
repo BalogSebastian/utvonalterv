@@ -255,7 +255,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     const enter = wallClock(depMs, startH);
     const leave = wallClock(depMs, endH);
     return {
-      country: vis.country, km: vis.km, tollKm: vis.tollKm,
+      country: vis.country, startKm: vis.startKm, km: vis.km, tollKm: vis.tollKm,
       toll: vis.tollKm * (rateOf.get(vis.country) ?? 0),
       enter: iso(enter), leave: iso(leave),
     };
@@ -289,12 +289,12 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     if (dayDrive > 4.5 + 0.05) {
       const atH = dayStart + 4.5;
       const pt = pointAt(atH);
-      stops.push({ kind: "break", atH, km: pt.km, lon: pt.c[0], lat: pt.c[1], country: countryAt(pt.c) ?? "??", time: iso(wallClock(depMs, atH)), day: day + 1 });
+      stops.push({ id: `b${day}`, f: atH / (drivingH || 1), kind: "break", atH, km: pt.km, lon: pt.c[0], lat: pt.c[1], country: countryAt(pt.c) ?? "??", time: iso(wallClock(depMs, atH)), day: day + 1 });
     }
     if (dayStart + dayDrive < drivingH - 0.05) {
       const atH = dayStart + dayDrive;
       const pt = pointAt(atH);
-      stops.push({ kind: "rest", atH, km: pt.km, lon: pt.c[0], lat: pt.c[1], country: countryAt(pt.c) ?? "??", time: iso(wallClock(depMs, atH)), day: day + 1 });
+      stops.push({ id: `r${day}`, f: atH / (drivingH || 1), kind: "rest", atH, km: pt.km, lon: pt.c[0], lat: pt.c[1], country: countryAt(pt.c) ?? "??", time: iso(wallClock(depMs, atH)), day: day + 1 });
     }
   }
 

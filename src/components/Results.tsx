@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { COUNTRY_NAMES } from "@/lib/countries";
+import { COUNTRY_NAMES } from "@/lib/country-names";
 import { dt, dur, eur, eur2, flag, huf, km } from "@/lib/format";
 import type { CostInputs, RouteResult } from "@/lib/types";
 
@@ -10,6 +10,10 @@ interface Props {
   selected: number;
   onSelect: (i: number) => void;
   costs: CostInputs;
+  onAddStop: (kind: "break" | "rest") => void;
+  onRemoveStop: (id: string) => void;
+  onResetStops: () => void;
+  edited: boolean;
 }
 
 function download(name: string, text: string, type: string) {
@@ -41,7 +45,7 @@ function csv(r: RouteResult, c: CostInputs) {
   return rows.map((row) => row.join(";")).join("\n");
 }
 
-export default function Results({ routes, selected, onSelect, costs }: Props) {
+export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited }: Props) {
   const [showSteps, setShowSteps] = useState(false);
   const [margin, setMargin] = useState(15);
   const [roundTrip, setRoundTrip] = useState(false);
@@ -195,19 +199,29 @@ export default function Results({ routes, selected, onSelect, costs }: Props) {
         </div>
       </section>
 
-      {r.stops.length > 0 && (
-        <section>
-          <h3 className="mb-2 text-sm font-semibold">Szünetek és pihenők helye</h3>
-          <ul className="space-y-1 text-sm">
-            {r.stops.map((st, i) => (
-              <li key={i} className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-1.5 dark:bg-slate-800/60">
+      <section>
+        <h3 className="mb-1 text-sm font-semibold">Szünetek és pihenők</h3>
+        <p className="mb-2 text-xs text-slate-500">Húzd a ☕ / 🌙 jelölőket a térképen az útvonal mentén – az idők, az országonkénti áthaladás, a tilalmak és a sofőrköltség azonnal újraszámolódnak.</p>
+        <ul className="space-y-1 text-sm">
+          {r.stops.map((st) => (
+            <li key={st.id} className={`rounded-lg px-3 py-1.5 ${st.warn ? "bg-red-50 dark:bg-red-950/40" : "bg-slate-50 dark:bg-slate-800/60"}`}>
+              <div className="flex items-center justify-between gap-2">
                 <span>{st.kind === "rest" ? "🌙 Napi pihenő" : "☕ 45 perc szünet"} · {st.day}. nap · {flag(st.country)} ~{Math.round(st.km)}. km</span>
-                <span className="text-xs text-slate-500">{dt(st.time)}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+                <span className="flex items-center gap-2">
+                  <span className="text-xs text-slate-500">{dt(st.time)}</span>
+                  <button className="text-slate-400 hover:text-red-600" title="Törlés" onClick={() => onRemoveStop(st.id)}>✕</button>
+                </span>
+              </div>
+              {st.warn && <div className="mt-0.5 text-xs text-red-700 dark:text-red-300">⚠ {st.warn}</div>}
+            </li>
+          ))}
+        </ul>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button className="btn" onClick={() => onAddStop("break")}>+ ☕ Szünet</button>
+          <button className="btn" onClick={() => onAddStop("rest")}>+ 🌙 Pihenő</button>
+          {edited && <button className="btn" onClick={onResetStops}>↺ Alaphelyzet</button>}
+        </div>
+      </section>
 
       <section>
         <h3 className="mb-2 text-sm font-semibold">Áthaladás országonként</h3>

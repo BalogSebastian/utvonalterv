@@ -1,4 +1,4 @@
-import { COUNTRY_NAMES } from "./countries";
+import { COUNTRY_NAMES } from "./country-names";
 import type { BanWarning } from "./types";
 
 interface Window {
