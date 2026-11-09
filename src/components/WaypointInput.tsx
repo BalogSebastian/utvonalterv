@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Waypoint } from "@/lib/types";
+import { Ico } from "./ui";
 
 interface Result { label: string; lat: number; lon: number }
 
@@ -47,7 +48,7 @@ export default function WaypointInput({ badge, badgeClass, placeholder, value, p
 
   return (
     <div className="relative flex items-center gap-2">
-      <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white ${badgeClass}`}>{badge}</span>
+      <span className={`relative z-[1] flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-full text-xs font-bold text-white ring-4 ring-white dark:ring-slate-900 ${badgeClass}`}>{badge}</span>
       <div className="relative min-w-0 flex-1">
         <input
           value={text}
@@ -55,7 +56,7 @@ export default function WaypointInput({ badge, badgeClass, placeholder, value, p
           onFocus={() => results.length && !value && setOpen(true)}
           onBlur={() => setTimeout(() => setOpen(false), 150)}
           placeholder={placeholder}
-          className={`w-full rounded-lg border bg-white px-3 py-2 pr-8 text-sm outline-none focus:ring-2 focus:ring-blue-500 dark:bg-slate-800 ${value ? "border-emerald-500/60" : "border-slate-300 dark:border-slate-600"}`}
+          className={`field w-full pr-8 ${value ? "!border-emerald-500/50 !bg-emerald-50/50 dark:!bg-emerald-950/20" : ""}`}
         />
         {busy && <span className="absolute right-2.5 top-2.5 h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600" />}
         {open && results.length > 0 && (
@@ -83,12 +84,12 @@ export default function WaypointInput({ badge, badgeClass, placeholder, value, p
         type="button"
         title="Pont kijelölése a térképen"
         onClick={onPickToggle}
-        className={`rounded-lg border px-2 py-2 text-sm ${picking ? "border-blue-600 bg-blue-600 text-white" : "border-slate-300 hover:bg-slate-100 dark:border-slate-600 dark:hover:bg-slate-700"}`}
+        className={`flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg border transition ${picking ? "border-blue-600 bg-blue-600 text-white" : "border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:text-blue-600 dark:border-slate-700 dark:bg-slate-800"}`}
       >
-        ⌖
+        <Ico name="crosshair" className="h-4 w-4" />
       </button>
       {onRemove && (
-        <button type="button" title="Útpont törlése" onClick={onRemove} className="rounded-lg px-2 py-2 text-sm text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700">✕</button>
+        <button type="button" title="Útpont törlése" onClick={onRemove} className="flex h-[34px] w-6 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:text-rose-600"><Ico name="x" className="h-4 w-4" /></button>
       )}
     </div>
   );

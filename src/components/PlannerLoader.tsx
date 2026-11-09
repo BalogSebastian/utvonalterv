@@ -1,12 +1,15 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import Splash from "./Splash";
 
-const Planner = dynamic(() => import("./Planner"), {
-  ssr: false,
-  loading: () => <div className="flex h-dvh items-center justify-center text-slate-500">Betöltés…</div>,
-});
+const Planner = dynamic(() => import("./Planner"), { ssr: false, loading: () => null });
 
 export default function PlannerLoader() {
-  return <Planner />;
+  return (
+    <>
+      <Planner />
+      <Splash />
+    </>
+  );
 }

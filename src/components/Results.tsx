@@ -69,7 +69,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
             <button
               key={i}
               onClick={() => onSelect(i)}
-              className={`rounded-xl border p-3 text-left transition ${i === selected ? "border-blue-600 bg-blue-50 ring-1 ring-blue-600 dark:bg-blue-950/40" : "border-slate-200 hover:border-slate-400 dark:border-slate-700"}`}
+              className={`rounded-2xl border bg-white p-3 text-left shadow-sm transition dark:bg-slate-900 ${i === selected ? "border-blue-600 ring-2 ring-blue-600/30" : "border-slate-200 hover:border-slate-400 dark:border-slate-700"}`}
             >
               <div className="flex items-baseline justify-between">
                 <span className="text-sm font-semibold">
@@ -87,7 +87,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
         </div>
       )}
 
-      <section className="rounded-xl bg-slate-900 p-4 text-white">
+      <section className="rounded-2xl bg-gradient-to-br from-[#12306a] via-[#0f1f3d] to-[#0b1426] p-4 text-white shadow-lg shadow-blue-900/20 ring-1 ring-white/10">
         <div className="text-xs uppercase tracking-wide text-slate-400">Teljes fuvarköltség</div>
         <div className="mt-1 flex items-baseline gap-3">
           <span className="text-3xl font-bold">{eur(r.totalEur)}</span>
@@ -112,8 +112,8 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
         <div className="mt-2 text-xs text-slate-400">Üzemanyag: {Math.round(r.fuelLiters)} liter</div>
       </section>
 
-      <section className="rounded-xl border border-slate-200 p-4 dark:border-slate-700">
-        <h3 className="mb-2 text-sm font-semibold">Ajánlati ár számítás</h3>
+      <section className="card">
+        <h3 className="h3">Ajánlati ár számítás</h3>
         {(() => {
           const base = r.totalEur * (roundTrip ? 2 : 1);
           const price = base * (1 + margin / 100);
@@ -141,7 +141,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
 
       {r.warnings.length > 0 && (
         <section className="space-y-2">
-          <h3 className="text-sm font-semibold">Forgalmi korlátozások az útvonalon</h3>
+          <h3 className="h3">Forgalmi korlátozások az útvonalon</h3>
           {[...r.warnings].sort((a, b) => (a.severity === "danger" ? -1 : 1) - (b.severity === "danger" ? -1 : 1)).map((w, i) => (
             <div key={i} className={`rounded-lg border px-3 py-2 text-sm ${w.severity === "danger" ? "border-red-300 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200" : "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300"}`}>
               {w.severity === "danger" ? "⛔ " : "ℹ️ "}{w.text}
@@ -152,8 +152,8 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
       )}
 
       <section>
-        <h3 className="mb-2 text-sm font-semibold">Útdíj országonként</h3>
-        <div className="overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700">
+        <h3 className="h3">Útdíj országonként</h3>
+        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
           <table className="w-full text-sm">
             <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-slate-800">
               <tr><th className="px-3 py-2 text-left">Ország</th><th className="px-2 py-2 text-right">Díjas km</th><th className="px-2 py-2 text-right">€/km</th><th className="px-3 py-2 text-right">Díj</th></tr>
@@ -203,7 +203,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
       </section>
 
       <section>
-        <h3 className="mb-2 text-sm font-semibold">Menetrend (EU 561/2006 szerint)</h3>
+        <h3 className="h3">Menetrend (EU 561/2006 szerint)</h3>
         <div className="grid grid-cols-2 gap-2 text-sm">
           <Stat k="Vezetési idő" v={dur(r.schedule.drivingH * 60)} />
           <Stat k="Összes idő pihenőkkel" v={`${r.schedule.totalH.toFixed(1)} óra`} />
@@ -214,7 +214,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
       </section>
 
       <section>
-        <h3 className="mb-1 text-sm font-semibold">Szünetek és pihenők</h3>
+        <h3 className="h3">Szünetek és pihenők</h3>
         <p className="mb-2 text-xs text-slate-500">Húzd a ☕ / 🌙 jelölőket a térképen: az útvonal mentén csúsztatva csak a menetrend számolódik újra; ha egy másik városba engeded el, ott köztes pont lesz, és az útvonal is újraszámolódik rajta át.</p>
         <ul className="space-y-1 text-sm">
           {r.stops.map((st) => (
@@ -238,7 +238,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
       </section>
 
       <section>
-        <h3 className="mb-2 text-sm font-semibold">Áthaladás országonként</h3>
+        <h3 className="h3">Áthaladás országonként</h3>
         <ul className="space-y-1 text-sm">
           {r.countries.map((c, i) => (
             <li key={i} className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-1.5 dark:bg-slate-800/60">
