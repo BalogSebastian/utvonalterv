@@ -73,6 +73,12 @@ function wallClock(departureMs: number, drivingH: number): number {
 }
 
 
+/** reális kamionos átlagsebesség (km/h) útosztályonként */
+const TRUCK_SPEED: Record<string, number> = {
+  motorway: 82, trunk: 72, primary: 62, secondary: 52, tertiary: 45,
+  unclassified: 38, residential: 30, service_other: 25,
+};
+
 const CHUNK_KM = Number(process.env.TRACE_CHUNK_KM) || 300;
 
 /** Egy leg élei, manőverhatáron ~300 km-es darabokban lekérve (a publikus szerver 1000 km-es limitje miatt). */
@@ -234,7 +240,10 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
   const tollTotalEur = tollBreakdown.reduce((s, t) => s + t.total, 0);
 
   // --- idő, szünetek ---
-  const drivingMin = trip.summary.time / 60;
+  // Menetidő: kamionos átlagsebességek útosztályonként (a routingot nem torzítjuk sebességkorláttal,
+  // különben az autópálya nem lenne vonzóbb a főútnál). Ha nincs élszintű adat: a Valhalla ideje +20%.
+  const modelMin = edges.reduce((sum, e) => sum + (e.km / (TRUCK_SPEED[e.roadClass ?? ""] ?? 40)) * 60, 0);
+  const drivingMin = accuracy === "edge" ? modelMin : (trip.summary.time / 60) * 1.2;
   const drivingH = drivingMin / 60;
   const depMs = Date.parse(`${o.departure}:00Z`);
   const sched = schedule(drivingH, Number.isFinite(depMs) ? depMs : Date.now());

@@ -74,7 +74,6 @@ export function truckCosting(v: Vehicle, o: RouteOptions) {
       width: v.width,
       length: v.length,
       hazmat: v.hazmat,
-      top_speed: 90,
       use_tolls: o.avoidTolls ? 0 : 1,
       use_highways: o.avoidHighways ? 0 : 1,
       use_truck_route: 0.8,
