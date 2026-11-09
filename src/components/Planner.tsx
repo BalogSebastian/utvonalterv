@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Results from "./Results";
 import WaypointInput from "./WaypointInput";
-import { addStop, applyPlan, defaultStops, type PlanStop } from "@/lib/schedule";
+import { addStop, applyPlan, cumulative, defaultStops, snapToRoute, type PlanStop } from "@/lib/schedule";
 import { DEFAULT_COSTS, VEHICLE_PRESETS } from "@/lib/presets";
 import type { CostInputs, EuroClass, RouteOptions, RouteResult, Vehicle, Waypoint } from "@/lib/types";
 
@@ -90,7 +90,7 @@ export default function Planner() {
 
   const ready = waypoints.every(Boolean);
 
-  const calc = async (wpsIn: (Waypoint | null)[] = waypoints) => {
+  const calc = async (wpsIn: (Waypoint | null)[] = waypoints, carry?: PlanStop[]) => {
     if (!wpsIn.every(Boolean)) return;
     setLoading(true);
     setError(null);
@@ -103,7 +103,7 @@ export default function Planner() {
       const j = await res.json();
       if (!res.ok) throw new Error(j.error ?? "Ismeretlen hiba");
       setRoutes(j.routes);
-      setPlans({});
+      setPlans(carry ? Object.fromEntries((j.routes as RouteResult[]).map((_, i) => [i, carry])) : {});
       setSelected(0);
       const wps = wpsIn as Waypoint[];
       const entry: Recent = { label: `${shortLabel(wps[0].label)} → ${shortLabel(wps[wps.length - 1].label)}`, waypoints: wps };
@@ -157,10 +157,72 @@ export default function Planner() {
   );
   const currentPlan = (): PlanStop[] => plans[selected] ?? (rawRoutes[selected] ? defaultStops(rawRoutes[selected]) : []);
   const setPlan = (p: PlanStop[]) => setPlans((all) => ({ ...all, [selected]: p }));
-  const onStopMove = (id: string, f: number) => setPlan(currentPlan().map((x) => (x.id === id ? { ...x, f } : x)));
+  const sameSpot = (w: Waypoint | null, a?: [number, number]) => !!w && !!a && Math.abs(w.lon - a[0]) < 1e-9 && Math.abs(w.lat - a[1]) < 1e-9;
+  /** a megálló köztes pontjának eltávolítása a pontlistából (ha volt) */
+  const withoutAnchor = (st?: PlanStop) => waypoints.filter((w) => !sameSpot(w, st?.anchor));
+  const relabel = async (lat: number, lon: number) => {
+    try {
+      const r = await fetch(`/api/geocode?lat=${lat}&lon=${lon}&place=1`);
+      const j = await r.json();
+      const label = j.results?.[0]?.label;
+      if (label) setWaypoints((ws) => ws.map((x) => (x && x.lat === lat && x.lon === lon ? { ...x, label } : x)));
+    } catch { /* marad a koordináta */ }
+  };
+
+  const onStopMove = (id: string, f: number) => {
+    const plan = currentPlan();
+    const st = plan.find((x) => x.id === id);
+    const next = plan.map((x) => (x.id === id ? { ...x, f, anchor: undefined } : x));
+    setPlan(next);
+    if (st?.anchor) {
+      // a megálló visszakerült az útvonalra: a hozzá tartozó köztes pont megszűnik, új útvonal
+      const wps = withoutAnchor(st);
+      setWaypoints(wps);
+      void calc(wps, next);
+    }
+  };
+  /** szabadon elengedett megálló: új köztes pont az útvonalon (a megálló oda kötődik) */
+  const onStopDrop = (id: string, lng: number, lat: number) => {
+    const route = rawRoutes[selected];
+    if (!route) return;
+    const plan = currentPlan();
+    const st = plan.find((x) => x.id === id);
+    const wps = withoutAnchor(st);
+    if (wps.length >= 12) { setError("Legfeljebb 12 útpont engedélyezett."); return; }
+    const cum = cumulative(route.geometry);
+    const fNew = snapToRoute(route.geometry, cum, [lng, lat]).f;
+    const fs = wps.map((w, i) => (i === 0 ? 0 : i === wps.length - 1 ? 1 : snapToRoute(route.geometry, cum, [w!.lon, w!.lat]).f));
+    let at = wps.length - 1;
+    for (let i = 1; i < wps.length - 1; i++) if (fs[i] > fNew) { at = i; break; }
+    const wp: Waypoint = { lat, lon: lng, label: `${lat.toFixed(5)}, ${lng.toFixed(5)}` };
+    const nextWps = [...wps.slice(0, at), wp, ...wps.slice(at)];
+    const nextPlan = plan.map((x) => (x.id === id ? { ...x, anchor: [lng, lat] as [number, number], f: fNew } : x));
+    setPlan(nextPlan);
+    setWaypoints(nextWps);
+    void calc(nextWps, nextPlan);
+    void relabel(lat, lng);
+  };
   const onAddStop = (kind: "break" | "rest") => setPlan(addStop(currentPlan(), kind));
-  const onRemoveStop = (id: string) => setPlan(currentPlan().filter((x) => x.id !== id));
-  const onResetStops = () => setPlans((all) => { const c = { ...all }; delete c[selected]; return c; });
+  const onRemoveStop = (id: string) => {
+    const plan = currentPlan();
+    const st = plan.find((x) => x.id === id);
+    const next = plan.filter((x) => x.id !== id);
+    setPlan(next);
+    if (st?.anchor) {
+      const wps = withoutAnchor(st);
+      setWaypoints(wps);
+      void calc(wps, next);
+    }
+  };
+  const onResetStops = () => {
+    const anchored = currentPlan().filter((x) => x.anchor);
+    setPlans((all) => { const c = { ...all }; delete c[selected]; return c; });
+    if (anchored.length) {
+      const wps = waypoints.filter((w) => !anchored.some((a) => sameSpot(w, a.anchor)));
+      setWaypoints(wps);
+      void calc(wps);
+    }
+  };
 
   const onWaypointDrag = async (i: number, lat: number, lon: number) => {
     const moved = waypoints.map((x, j) => (j === i ? { lat, lon, label: `${lat.toFixed(5)}, ${lon.toFixed(5)}` } : x));
@@ -323,6 +385,7 @@ export default function Planner() {
           onPick={onPick}
           onSelectRoute={setSelected}
           onStopMove={onStopMove}
+          onStopDrop={onStopDrop}
           onWaypointDrag={onWaypointDrag}
         />
       </main>

@@ -22,6 +22,7 @@ interface Props {
   onPick: (lat: number, lon: number) => void;
   onSelectRoute: (i: number) => void;
   onStopMove: (id: string, f: number) => void;
+  onStopDrop: (id: string, lng: number, lat: number) => void;
   onWaypointDrag: (i: number, lat: number, lon: number) => void;
 }
 
@@ -52,7 +53,7 @@ function supportsWebGL2(): boolean {
 }
 
 export default function MapView({
-  waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onWaypointDrag,
+  waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onStopDrop, onWaypointDrag,
 }: Props) {
   const [glOk] = useState(supportsWebGL2);
   const el = useRef<HTMLDivElement>(null);
@@ -67,6 +68,7 @@ export default function MapView({
   const pickRef = useRef({ pickMode, onPick });
   const selectRef = useRef(onSelectRoute);
   const stopMoveRef = useRef(onStopMove);
+  const stopDropRef = useRef(onStopDrop);
   const wpDragRef = useRef(onWaypointDrag);
   const vehicleRef = useRef(vehicle);
 
@@ -74,6 +76,7 @@ export default function MapView({
     pickRef.current = { pickMode, onPick };
     selectRef.current = onSelectRoute;
     stopMoveRef.current = onStopMove;
+    stopDropRef.current = onStopDrop;
     wpDragRef.current = onWaypointDrag;
     vehicleRef.current = vehicle;
   });
@@ -227,17 +230,15 @@ export default function MapView({
     for (const st of route.stops) {
       const d = document.createElement("div");
       d.textContent = st.kind === "rest" ? "🌙" : "☕";
-      d.title = `${st.kind === "rest" ? "Napi pihenő" : "45 perc szünet"} – ${st.day}. nap, ~${Math.round(st.km)}. km – húzd az útvonal mentén`;
+      d.title = `${st.kind === "rest" ? "Napi pihenő" : "45 perc szünet"} – ${st.day}. nap, ~${Math.round(st.km)}. km – húzd bárhová: az útvonal mentén vagy egy másik városba`;
       d.style.cssText = `font-size:15px;width:28px;height:28px;border-radius:50%;background:#fff;border:2px solid ${st.warn ? "#dc2626" : "#334155"};display:flex;align-items:center;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,.45);cursor:grab`;
       const mk = new maplibregl.Marker({ element: d, draggable: true }).setLngLat([st.lon, st.lat]).addTo(map);
-      // húzás közben az útvonalhoz "tapad"
-      mk.on("drag", () => {
-        const ll = mk.getLngLat();
-        mk.setLngLat(snapToRoute(route.geometry, cum, [ll.lng, ll.lat]).point);
-      });
+      // szabadon húzható: az útvonal közelében az útvonal mentén mozog, távol új köztes pont lesz
       mk.on("dragend", () => {
         const ll = mk.getLngLat();
-        stopMoveRef.current(st.id, snapToRoute(route.geometry, cum, [ll.lng, ll.lat]).f);
+        const snap = snapToRoute(route.geometry, cum, [ll.lng, ll.lat]);
+        if (snap.distKm < 2) stopMoveRef.current(st.id, snap.f);
+        else stopDropRef.current(st.id, ll.lng, ll.lat);
       });
       stopMarkers.current.push(mk);
     }

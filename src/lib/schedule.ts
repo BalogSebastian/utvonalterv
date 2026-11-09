@@ -8,6 +8,8 @@ export interface PlanStop {
   kind: "break" | "rest";
   /** az útvonal mentén megtett arány 0..1 */
   f: number;
+  /** ha meg van adva: a megálló egy valós helyhez [lng,lat] kötött (köztes pont az útvonalon) */
+  anchor?: LngLat;
 }
 
 const BREAK_H = 0.75;
@@ -33,7 +35,7 @@ export function cumulative(geometry: LngLat[]): number[] {
 }
 
 /** Egy pont rávetítése az útvonalra: arány (0..1) és a vetített koordináta. */
-export function snapToRoute(geometry: LngLat[], cum: number[], p: LngLat): { f: number; point: LngLat } {
+export function snapToRoute(geometry: LngLat[], cum: number[], p: LngLat): { f: number; point: LngLat; distKm: number } {
   const total = cum[cum.length - 1] || 1;
   const k = Math.cos((p[1] * Math.PI) / 180);
   let best = Infinity;
@@ -56,7 +58,7 @@ export function snapToRoute(geometry: LngLat[], cum: number[], p: LngLat): { f: 
       bestF = (cum[i - 1] + (cum[i] - cum[i - 1]) * t) / total;
     }
   }
-  return { f: Math.max(0, Math.min(1, bestF)), point: bestPt };
+  return { f: Math.max(0, Math.min(1, bestF)), point: bestPt, distKm: Math.sqrt(best) * 110.57 };
 }
 
 export function pointAtFraction(geometry: LngLat[], cum: number[], f: number): LngLat {
@@ -93,8 +95,10 @@ export function applyPlan(
   if (!Number.isFinite(depMs)) return route;
 
   const drivingH = route.drivingMin / 60;
-  const sorted = [...plan].sort((a, b) => a.f - b.f);
   const cum = cumulative(route.geometry);
+  const sorted = plan
+    .map((st) => (st.anchor ? { ...st, f: snapToRoute(route.geometry, cum, st.anchor).f } : st))
+    .sort((a, b) => a.f - b.f);
 
   // --- szimuláció ---
   let t = depMs;
@@ -137,7 +141,7 @@ export function applyPlan(
     const km = st.f * route.distanceKm;
     const leg = route.countries.find((c) => km >= c.startKm && km <= c.startKm + c.km) ?? route.countries[route.countries.length - 1];
     stops.push({
-      id: st.id, kind: st.kind, f: st.f, atH: st.f * drivingH, km, lon: pt[0], lat: pt[1],
+      id: st.id, anchored: !!st.anchor, kind: st.kind, f: st.f, atH: st.f * drivingH, km, lon: pt[0], lat: pt[1],
       country: leg?.country ?? "??", time: iso(arrive), day: rests + (st.kind === "rest" ? 0 : 1),
       warn,
     });

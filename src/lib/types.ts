@@ -83,6 +83,7 @@ export interface TollBreakdownItem {
 
 export interface TripStop {
   id: string;
+  anchored?: boolean;
   /** a menetrend-szabály megsértése ennél a megállónál */
   warn?: string;
   /** az útvonal mentén megtett arány 0..1 */

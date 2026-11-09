@@ -8,7 +8,7 @@ export async function GET(req: NextRequest) {
   const reverse = lat !== null && lon !== null && Number.isFinite(+lat) && Number.isFinite(+lon);
   if (!reverse && (!q || q.length < 2)) return Response.json({ results: [] });
   const url = reverse
-    ? `https://photon.komoot.io/reverse?lat=${+lat!}&lon=${+lon!}&lang=en`
+    ? `https://photon.komoot.io/reverse?lat=${+lat!}&lon=${+lon!}&lang=en${req.nextUrl.searchParams.get("place") ? "&layer=city&layer=locality" : ""}`
     : `https://photon.komoot.io/api/?q=${encodeURIComponent(q!)}&limit=6&lang=en`;
   try {
     const res = await fetch(url, {

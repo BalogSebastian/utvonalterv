@@ -201,12 +201,12 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
 
       <section>
         <h3 className="mb-1 text-sm font-semibold">Szünetek és pihenők</h3>
-        <p className="mb-2 text-xs text-slate-500">Húzd a ☕ / 🌙 jelölőket a térképen az útvonal mentén – az idők, az országonkénti áthaladás, a tilalmak és a sofőrköltség azonnal újraszámolódnak.</p>
+        <p className="mb-2 text-xs text-slate-500">Húzd a ☕ / 🌙 jelölőket a térképen: az útvonal mentén csúsztatva csak a menetrend számolódik újra; ha egy másik városba engeded el, ott köztes pont lesz, és az útvonal is újraszámolódik rajta át.</p>
         <ul className="space-y-1 text-sm">
           {r.stops.map((st) => (
             <li key={st.id} className={`rounded-lg px-3 py-1.5 ${st.warn ? "bg-red-50 dark:bg-red-950/40" : "bg-slate-50 dark:bg-slate-800/60"}`}>
               <div className="flex items-center justify-between gap-2">
-                <span>{st.kind === "rest" ? "🌙 Napi pihenő" : "☕ 45 perc szünet"} · {st.day}. nap · {flag(st.country)} ~{Math.round(st.km)}. km</span>
+                <span>{st.kind === "rest" ? "🌙 Napi pihenő" : "☕ 45 perc szünet"}{st.anchored ? " 📍" : ""} · {st.day}. nap · {flag(st.country)} ~{Math.round(st.km)}. km</span>
                 <span className="flex items-center gap-2">
                   <span className="text-xs text-slate-500">{dt(st.time)}</span>
                   <button className="text-slate-400 hover:text-red-600" title="Törlés" onClick={() => onRemoveStop(st.id)}>✕</button>
