@@ -68,6 +68,7 @@ export default function Planner() {
   const [showRestr, setShowRestr] = useState(false);
   const [pickIdx, setPickIdx] = useState<number | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
+  const [keepView, setKeepView] = useState(false);
 
   useEffect(() => {
     try { localStorage.setItem(LS, JSON.stringify({ vehicle, costs })); } catch { /* privát mód */ }
@@ -91,8 +92,9 @@ export default function Planner() {
 
   const ready = waypoints.every(Boolean);
 
-  const calc = async (wpsIn: (Waypoint | null)[] = waypoints, carry?: PlanStop[]) => {
+  const calc = async (wpsIn: (Waypoint | null)[] = waypoints, carry?: PlanStop[], keep = false) => {
     if (!wpsIn.every(Boolean)) return;
+    setKeepView(keep);
     setLoading(true);
     setError(null);
     try {
@@ -107,7 +109,7 @@ export default function Planner() {
       setPlans(carry ? Object.fromEntries((j.routes as RouteResult[]).map((_, i) => [i, carry])) : {});
       setSelected(0);
       const wps = wpsIn as Waypoint[];
-      const entry: Recent = { label: `${shortLabel(wps[0].label)} → ${shortLabel(wps[wps.length - 1].label)}`, waypoints: wps };
+      const entry: Recent = { label: `${shortLabel(wps[0].label)} → ${shortLabel(wps[wps.length - 1].label)}`, waypoints: wps.filter((w) => !w.via) };
       const next = [entry, ...recent.filter((r) => r.label !== entry.label)].slice(0, 5);
       setRecent(next);
       try { localStorage.setItem(RECENT, JSON.stringify(next)); } catch { /* privát mód */ }
@@ -163,9 +165,13 @@ export default function Planner() {
   const withoutAnchor = (st?: PlanStop) => waypoints.filter((w) => !sameSpot(w, st?.anchor));
   const relabel = async (lat: number, lon: number) => {
     try {
-      const r = await fetch(`/api/geocode?lat=${lat}&lon=${lon}&place=1`);
-      const j = await r.json();
-      const label = j.results?.[0]?.label;
+      let label: string | undefined;
+      for (const q of ["&place=1", ""]) {
+        const r = await fetch(`/api/geocode?lat=${lat}&lon=${lon}${q}`);
+        const j = await r.json();
+        label = j.results?.[0]?.label;
+        if (label) break;
+      }
       if (label) setWaypoints((ws) => ws.map((x) => (x && x.lat === lat && x.lon === lon ? { ...x, label } : x)));
     } catch { /* marad a koordináta */ }
   };
@@ -226,15 +232,38 @@ export default function Planner() {
   };
 
   const onWaypointDrag = async (i: number, lat: number, lon: number) => {
-    const moved = waypoints.map((x, j) => (j === i ? { lat, lon, label: `${lat.toFixed(5)}, ${lon.toFixed(5)}` } : x));
+    const moved = waypoints.map((x, j) => (j === i ? { ...x, lat, lon, label: `${lat.toFixed(5)}, ${lon.toFixed(5)}` } : x));
     setWaypoints(moved);
-    void calc(moved);
+    void calc(moved, undefined, true);
     try {
       const r = await fetch(`/api/geocode?lat=${lat}&lon=${lon}`);
       const j = await r.json();
       const label = j.results?.[0]?.label;
       if (label) setWaypoints((ws) => ws.map((x, k) => (k === i && x?.lat === lat ? { ...x, label } : x)));
     } catch { /* marad a koordináta */ }
+  };
+
+  /** az útvonal megfogása és elengedése: új áthaladási pont a megfelelő helyre */
+  const onRouteDrag = async (f: number, lat: number, lon: number) => {
+    const route = rawRoutes[selected];
+    const wps = waypoints.filter((w): w is Waypoint => !!w);
+    if (!route || wps.length !== waypoints.length) return;
+    if (wps.length >= 12) { setError("Legfeljebb 12 útpont engedélyezett – törölj egy áthaladási pontot (dupla kattintás)."); return; }
+    const cum = cumulative(route.geometry);
+    const fs = wps.map((w, i) => (i === 0 ? 0 : i === wps.length - 1 ? 1 : snapToRoute(route.geometry, cum, [w.lon, w.lat]).f));
+    let at = wps.length - 1;
+    for (let i = 1; i < wps.length; i++) if (fs[i] >= f) { at = i; break; }
+    const wp: Waypoint = { lat, lon, label: `${lat.toFixed(5)}, ${lon.toFixed(5)}`, via: true };
+    const next = [...wps.slice(0, at), wp, ...wps.slice(at)];
+    setWaypoints(next);
+    void calc(next, undefined, true);
+    void relabel(lat, lon);
+  };
+  const onWaypointRemove = (i: number) => {
+    if (i === 0 || i === waypoints.length - 1) return;
+    const next = waypoints.filter((_, j) => j !== i);
+    setWaypoints(next);
+    void calc(next, undefined, true);
   };
 
   const presetId = useMemo(
@@ -262,7 +291,7 @@ export default function Planner() {
         </header>
 
         <div className={`flex-1 space-y-3.5 overflow-y-auto px-4 pb-5 pt-4 ${panelOpen ? "" : "hidden md:block"}`}>
-          <Card icon="route" title="Útvonal" hint="Jobb klikk a térképen: indulás / köztes pont / cél">
+          <Card icon="route" title="Útvonal" hint="Jobb klikk: indulás / köztes pont / cél · az útvonal a térképen megfogható és húzható">
             <div className="relative space-y-2">
               <div className="absolute bottom-4 left-[13px] top-4 w-px border-l-2 border-dashed border-slate-300 dark:border-slate-600" />
               {waypoints.map((w, i) => {
@@ -271,14 +300,14 @@ export default function Planner() {
                 return (
                   <WaypointInput
                     key={`${i}-${waypoints.length}-${w?.label ?? ""}`}
-                    badge={first ? "A" : last ? "B" : String(i)}
+                    badge={first ? "A" : last ? "B" : w?.via ? "↝" : String(i)}
                     badgeClass={first ? "bg-emerald-500" : last ? "bg-rose-500" : "bg-slate-500"}
-                    placeholder={first ? "Indulás (város, cím…)" : last ? "Érkezés" : "Köztes pont"}
+                    placeholder={first ? "Indulás (város, cím…)" : last ? "Érkezés" : w?.via ? "Áthaladási pont" : "Köztes pont"}
                     value={w}
                     picking={pickIdx === i}
                     onChange={(nw) => setWp(i, nw)}
                     onPickToggle={() => setPickIdx(pickIdx === i ? null : i)}
-                    onRemove={!first && !last ? () => setWaypoints((ws) => ws.filter((_, j) => j !== i)) : undefined}
+                    onRemove={!first && !last ? () => (rawRoutes.length && w ? onWaypointRemove(i) : setWaypoints((ws) => ws.filter((_, j) => j !== i))) : undefined}
                   />
                 );
               })}
@@ -407,6 +436,9 @@ export default function Planner() {
           onStopMove={onStopMove}
           onStopDrop={onStopDrop}
           onWaypointDrag={onWaypointDrag}
+          onRouteDrag={onRouteDrag}
+          onWaypointRemove={onWaypointRemove}
+          keepView={keepView}
         />
       </main>
     </div>

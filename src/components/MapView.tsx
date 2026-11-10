@@ -24,6 +24,12 @@ interface Props {
   onStopMove: (id: string, f: number) => void;
   onStopDrop: (id: string, lng: number, lat: number) => void;
   onWaypointDrag: (i: number, lat: number, lon: number) => void;
+  /** az útvonal megfogása és elengedése: új áthaladási pont (f = arány az útvonal mentén) */
+  onRouteDrag: (f: number, lat: number, lon: number) => void;
+  /** áthaladási pont törlése (dupla kattintás a ponton) */
+  onWaypointRemove: (i: number) => void;
+  /** igaz: az új útvonalnál ne zoomoljon rá (húzás után) */
+  keepView?: boolean;
 }
 
 const EMPTY: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
@@ -53,7 +59,7 @@ function supportsWebGL2(): boolean {
 }
 
 export default function MapView({
-  waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onStopDrop, onWaypointDrag,
+  waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onStopDrop, onWaypointDrag, onRouteDrag, onWaypointRemove, keepView,
 }: Props) {
   const [glOk] = useState(supportsWebGL2);
   const el = useRef<HTMLDivElement>(null);
@@ -70,6 +76,11 @@ export default function MapView({
   const stopMoveRef = useRef(onStopMove);
   const stopDropRef = useRef(onStopDrop);
   const wpDragRef = useRef(onWaypointDrag);
+  const routeDragRef = useRef(onRouteDrag);
+  const wpRemoveRef = useRef(onWaypointRemove);
+  const keepViewRef = useRef(keepView);
+  /** a kijelölt útvonal + a pontok (a húzás eseménykezelői ezt olvassák) */
+  const dragCtx = useRef<{ geometry: [number, number][]; cum: number[]; wps: Waypoint[] }>({ geometry: [], cum: [], wps: [] });
   const vehicleRef = useRef(vehicle);
 
   useEffect(() => {
@@ -78,6 +89,9 @@ export default function MapView({
     stopMoveRef.current = onStopMove;
     stopDropRef.current = onStopDrop;
     wpDragRef.current = onWaypointDrag;
+    routeDragRef.current = onRouteDrag;
+    wpRemoveRef.current = onWaypointRemove;
+    keepViewRef.current = keepView;
     vehicleRef.current = vehicle;
   });
 
@@ -105,7 +119,7 @@ export default function MapView({
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
     map.on("load", () => {
-      for (const id of ["alt", "main", "toll", "restr", "park"]) map.addSource(id, { type: "geojson", data: EMPTY });
+      for (const id of ["alt", "main", "toll", "restr", "park", "drag", "handle"]) map.addSource(id, { type: "geojson", data: EMPTY });
       map.addLayer({ id: "alt-line", type: "line", source: "alt", layout: { "line-cap": "round", "line-join": "round" },
         paint: { "line-color": "#64748b", "line-width": 5, "line-opacity": 0.55 } });
       map.addLayer({ id: "main-case", type: "line", source: "main", layout: { "line-cap": "round", "line-join": "round" },
@@ -114,6 +128,10 @@ export default function MapView({
         paint: { "line-color": "#2563eb", "line-width": 6 } });
       map.addLayer({ id: "toll-line", type: "line", source: "toll", layout: { "line-cap": "butt", "line-join": "round" },
         paint: { "line-color": "#f59e0b", "line-width": 3, "line-dasharray": [1.2, 1] } });
+      map.addLayer({ id: "drag-line", type: "line", source: "drag", layout: { "line-cap": "round", "line-join": "round" },
+        paint: { "line-color": "#1d4ed8", "line-width": 4, "line-dasharray": [1.5, 1.2], "line-opacity": 0.9 } });
+      map.addLayer({ id: "handle-dot", type: "circle", source: "handle",
+        paint: { "circle-radius": 7, "circle-color": "#ffffff", "circle-stroke-color": "#1d4ed8", "circle-stroke-width": 3 } });
       map.addLayer({ id: "restr-line", type: "line", source: "restr", layout: { "line-cap": "round" },
         paint: { "line-color": "#dc2626", "line-width": ["interpolate", ["linear"], ["zoom"], 10, 3, 16, 8], "line-opacity": 0.9 } });
 
@@ -150,6 +168,78 @@ export default function MapView({
         map.on("mouseenter", l, () => (map.getCanvas().style.cursor = "pointer"));
         map.on("mouseleave", l, () => (map.getCanvas().style.cursor = ""));
       }
+      // --- az útvonal szabad húzása (Google Maps-szerűen) ---
+      const canvas = map.getCanvas();
+      const setSrc = (id: string, data: GeoJSON.FeatureCollection) => (map.getSource(id) as GeoJSONSource).setData(data);
+      const point = (c: [number, number]): GeoJSON.FeatureCollection => ({ type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: c } }] });
+      let dragging: { f: number; prev: [number, number]; next: [number, number]; moved: boolean } | null = null;
+      const neighbours = (f: number) => {
+        const { geometry, cum, wps } = dragCtx.current;
+        const fs = wps.map((w, i) => (i === 0 ? 0 : i === wps.length - 1 ? 1 : snapToRoute(geometry, cum, [w.lon, w.lat]).f));
+        let at = wps.length - 1;
+        for (let i = 1; i < wps.length; i++) if (fs[i] >= f) { at = i; break; }
+        const a = wps[at - 1];
+        const b = wps[at];
+        return { prev: [a.lon, a.lat] as [number, number], next: [b.lon, b.lat] as [number, number] };
+      };
+      const startDrag = (lng: number, lat: number) => {
+        const { geometry, cum, wps } = dragCtx.current;
+        if (geometry.length < 2 || wps.length < 2 || pickRef.current.pickMode !== null) return false;
+        const snap = snapToRoute(geometry, cum, [lng, lat]);
+        dragging = { f: snap.f, ...neighbours(snap.f), moved: false };
+        map.dragPan.disable();
+        setMenu(null);
+        canvas.style.cursor = "grabbing";
+        return true;
+      };
+      const moveDrag = (lng: number, lat: number) => {
+        if (!dragging) return;
+        dragging.moved = true;
+        setSrc("handle", point([lng, lat]));
+        setSrc("drag", { type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: [dragging.prev, [lng, lat], dragging.next] } }] });
+      };
+      const endDrag = (lng: number, lat: number) => {
+        if (!dragging) return;
+        const d = dragging;
+        dragging = null;
+        map.dragPan.enable();
+        canvas.style.cursor = "";
+        setSrc("drag", EMPTY);
+        setSrc("handle", EMPTY);
+        if (d.moved) routeDragRef.current(d.f, lat, lng);
+      };
+      map.on("mousemove", (e) => {
+        if (dragging) { moveDrag(e.lngLat.lng, e.lngLat.lat); return; }
+        if (pickRef.current.pickMode !== null) return;
+        const hit = map.queryRenderedFeatures([[e.point.x - 6, e.point.y - 6], [e.point.x + 6, e.point.y + 6]], { layers: ["main-line"] }).length > 0;
+        const { geometry, cum } = dragCtx.current;
+        if (hit && geometry.length > 1) {
+          setSrc("handle", point(snapToRoute(geometry, cum, [e.lngLat.lng, e.lngLat.lat]).point));
+          canvas.style.cursor = "grab";
+        } else {
+          setSrc("handle", EMPTY);
+          if (canvas.style.cursor === "grab") canvas.style.cursor = "";
+        }
+      });
+      map.on("mousedown", "main-line", (e) => {
+        if (e.originalEvent.button !== 0) return;
+        if (startDrag(e.lngLat.lng, e.lngLat.lat)) e.preventDefault();
+      });
+      map.on("mouseup", (e) => endDrag(e.lngLat.lng, e.lngLat.lat));
+      canvas.addEventListener("mouseleave", () => { if (dragging) { dragging = null; map.dragPan.enable(); setSrc("drag", EMPTY); setSrc("handle", EMPTY); } });
+      // érintőképernyő: hosszan nyomva fogja meg az útvonalat
+      let touchTimer: ReturnType<typeof setTimeout> | undefined;
+      map.on("touchstart", "main-line", (e) => {
+        if (e.points.length !== 1) return;
+        const ll = e.lngLat;
+        touchTimer = setTimeout(() => { if (startDrag(ll.lng, ll.lat)) moveDrag(ll.lng, ll.lat); }, 350);
+      });
+      map.on("touchmove", (e) => {
+        if (dragging) { e.preventDefault(); moveDrag(e.lngLat.lng, e.lngLat.lat); }
+        else clearTimeout(touchTimer);
+      });
+      map.on("touchend", (e) => { clearTimeout(touchTimer); endDrag(e.lngLat.lng, e.lngLat.lat); });
+
       setReady(true);
     });
     map.on("click", (e) => {
@@ -179,10 +269,18 @@ export default function MapView({
       const first = i === 0;
       const last = i === waypoints.length - 1;
       const d = document.createElement("div");
-      d.textContent = first ? "A" : last ? "B" : String(i);
-      d.style.cssText = `width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font:700 13px system-ui;color:#fff;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.45);background:${first ? "#16a34a" : last ? "#dc2626" : "#475569"}`;
+      const via = !first && !last && w.via;
+      d.textContent = first ? "A" : last ? "B" : via ? "" : String(i);
+      d.style.cssText = via
+        ? "width:16px;height:16px;border-radius:50%;background:#fff;border:3px solid #1d4ed8;box-shadow:0 1px 4px rgba(0,0,0,.45)"
+        : `width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font:700 13px system-ui;color:#fff;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.45);background:${first ? "#16a34a" : last ? "#dc2626" : "#475569"}`;
       d.style.cursor = "grab";
-      d.title = "Húzd az áthelyezéshez (új útvonalat számol)";
+      d.title = first || last
+        ? "Húzd az áthelyezéshez (új útvonalat számol)"
+        : "Húzd az áthelyezéshez · dupla kattintás: törlés";
+      if (!first && !last) {
+        d.addEventListener("dblclick", (ev) => { ev.stopPropagation(); ev.preventDefault(); wpRemoveRef.current(i); });
+      }
       const mk = new maplibregl.Marker({ element: d, draggable: true }).setLngLat([w.lon, w.lat]).addTo(map);
       mk.on("dragend", () => {
         const ll = mk.getLngLat();
@@ -198,6 +296,11 @@ export default function MapView({
     const map = mapRef.current;
     if (!map || !ready) return;
     const sel = routes[selected];
+    dragCtx.current = {
+      geometry: sel?.geometry ?? [],
+      cum: sel ? cumulative(sel.geometry) : [],
+      wps: waypoints.filter((w): w is Waypoint => !!w),
+    };
     const set = (id: string, data: GeoJSON.FeatureCollection) => (map.getSource(id) as GeoJSONSource).setData(data);
     set("main", sel ? { type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: sel.geometry } }] } : EMPTY);
     set("alt", {
@@ -207,12 +310,16 @@ export default function MapView({
       ),
     });
     set("toll", sel ? { type: "FeatureCollection", features: sel.tollGeometry.map((g) => ({ type: "Feature" as const, properties: {}, geometry: { type: "LineString" as const, coordinates: g } })) } : EMPTY);
-  }, [routes, selected, ready]);
+  }, [routes, selected, ready, waypoints]);
 
-  // fit bounds on new route set
+  // fit bounds on new route set (húzás után a nézet marad)
+  const lastFit = useRef<unknown>(null);
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !ready || !routes.length) return;
+    if (lastFit.current === routes[0].geometry) return;
+    lastFit.current = routes[0].geometry;
+    if (keepViewRef.current) return;
     const b = new maplibregl.LngLatBounds();
     routes[0].geometry.forEach((c) => b.extend(c));
     map.fitBounds(b, { padding: { top: 60, bottom: 60, left: 60, right: 60 }, duration: 800 });
@@ -395,6 +502,7 @@ export default function MapView({
         <div><span className="mr-1.5 inline-block h-1.5 w-5 rounded-sm bg-blue-600 align-middle" />Útvonal</div>
         <div><span className="mr-1.5 inline-block w-5 border-t-2 border-dashed border-amber-500 align-middle" />Díjköteles szakasz</div>
         <div><span className="mr-1.5 inline-block h-1.5 w-5 rounded-sm bg-slate-500 align-middle" />Alternatíva</div>
+        <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">Az útvonal megfogható és húzható</div>
       </div>
     </div>
   );

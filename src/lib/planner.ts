@@ -4,7 +4,7 @@ import { decodePolyline, encodePolyline } from "./polyline";
 import { TOLL_RULES, fixedFee, isTolledEdge, ratePerKm } from "./tolls";
 import { SPECIALS, specialFee } from "./specials";
 import {
-  routeRequest, traceEdges, type VEdge, type VLeg, type VTrip,
+  routeRequest, traceEdges, type VLeg, type VTrip,
 } from "./valhalla";
 import type {
   CountryLeg, DriveSchedule, LngLat, RouteRequest, RouteResult, TollBreakdownItem, TripStop, SpecialItem,
@@ -16,6 +16,8 @@ interface EdgeLike {
   roadClass?: string;
   name?: string;
   names?: string[];
+  /** ország a routing-szerver közigazgatási adataiból (pontos határ) */
+  cc?: string;
   a: LngLat;
   b: LngLat;
   /** index range a geometria pontjaiban (tollGeometry-hez) */
@@ -75,6 +77,17 @@ function wallClock(departureMs: number, drivingH: number): number {
 }
 
 
+/** az út legjobb megnevezése: útszám (M1, A4, D2, S16…), nem az E-szám vagy utcanév */
+function refName(names?: string[]): string | undefined {
+  if (!names?.length) return undefined;
+  return (
+    names.find((n) => /^[A-DF-Z][A-Z]{0,2} ?\d{1,4}[a-z]?$/.test(n)) ??
+    names.find((n) => /^\d{1,4}$/.test(n)) ??
+    names.find((n) => /^E ?\d+$/.test(n)) ??
+    names[0]
+  );
+}
+
 /** reális kamionos átlagsebesség (km/h) útosztályonként */
 const TRUCK_SPEED: Record<string, number> = {
   motorway: 82, trunk: 72, primary: 62, secondary: 52, tertiary: 45,
@@ -107,7 +120,7 @@ async function legEdges(
 
   let exact = true;
   const edges: EdgeLike[] = [];
-  const results: PromiseSettledResult<{ shape: string; edges: VEdge[] }>[] = [];
+  const results: PromiseSettledResult<Awaited<ReturnType<typeof traceEdges>>>[] = [];
   const CONC = 3;
   for (let i = 0; i < chunks.length; i += CONC) {
     const batch = chunks.slice(i, i + CONC).map((c) =>
@@ -119,9 +132,12 @@ async function legEdges(
     const t = results[ci];
     if (t.status === "fulfilled" && t.value.edges?.length) {
       const sh = decodePolyline(t.value.shape);
+      const admins = t.value.admins ?? [];
       for (const e of t.value.edges) {
+        const ai = e.end_node?.admin_index;
+        const cc = ai !== undefined ? admins[ai]?.country_code : undefined;
         edges.push({
-          km: e.length, toll: !!e.toll, roadClass: e.road_class, name: e.names?.[0], names: e.names,
+          km: e.length, toll: !!e.toll, roadClass: e.road_class, name: refName(e.names), names: e.names, cc: cc || undefined,
           a: sh[e.begin_shape_index], b: sh[e.end_shape_index],
           i0: c.from + e.begin_shape_index, i1: c.from + e.end_shape_index,
         });
@@ -159,36 +175,44 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
 
   // --- országok, díjköteles km-ek ---
   let curCountry = countryAt(fullCoords[0]) ?? "??";
-  interface Visit { country: string; km: number; tollKm: number; startKm: number }
+  interface Visit { country: string; km: number; tollKm: number; startKm: number; cost: number }
   const visits: Visit[] = [];
   const tollRuns: [number, number][] = [];
   let cumKm = 0;
   let totalKm = 0;
   for (const e of edges) totalKm += e.km;
 
-  const perCountry = new Map<string, { km: number; tollKm: number }>();
+  const perCountry = new Map<string, { km: number; tollKm: number; cost: number }>();
   const roadKm = new Map<string, Map<string, number>>();
   const specialKm = new Map<string, number>();
   for (const e of edges) {
     const mid: LngLat = [(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2];
-    const cc = countryAt(mid) ?? countryAt(e.a) ?? curCountry;
+    const cc = e.cc ?? countryAt(mid) ?? countryAt(e.a) ?? curCountry;
     curCountry = cc;
+    let replaced = false;
     if (e.names?.length) {
-      for (const sp of SPECIALS) if (sp.test(e.names, cc)) specialKm.set(sp.id, (specialKm.get(sp.id) ?? 0) + e.km);
+      for (const sp of SPECIALS) {
+        if (!sp.test(e.names, cc, mid)) continue;
+        specialKm.set(sp.id, (specialKm.get(sp.id) ?? 0) + e.km);
+        if (sp.replacesKm) replaced = true;
+      }
     }
     const rule = TOLL_RULES[cc];
     const tolled = rule ? isTolledEdge(rule, e.roadClass, e.toll) : false;
+    const cost = tolled && rule && !replaced ? e.km * ratePerKm(rule, v, e.roadClass, c.eurHuf) : 0;
     let last = visits[visits.length - 1];
     if (!last || last.country !== cc) {
-      last = { country: cc, km: 0, tollKm: 0, startKm: cumKm };
+      last = { country: cc, km: 0, tollKm: 0, startKm: cumKm, cost: 0 };
       visits.push(last);
     }
     last.km += e.km;
-    const agg = perCountry.get(cc) ?? { km: 0, tollKm: 0 };
+    const agg = perCountry.get(cc) ?? { km: 0, tollKm: 0, cost: 0 };
     agg.km += e.km;
     if (tolled) {
       last.tollKm += e.km;
+      last.cost += cost;
       agg.tollKm += e.km;
+      agg.cost += cost;
       if (e.name) {
         const m = roadKm.get(cc) ?? new Map<string, number>();
         m.set(e.name, (m.get(e.name) ?? 0) + e.km);
@@ -214,6 +238,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
       if (prev && next && prev.country === next.country) {
         prev.km += cur.km + next.km;
         prev.tollKm += cur.tollKm + next.tollKm;
+        prev.cost += cur.cost + next.cost;
         visits.splice(i, 2);
         changed = true;
         break;
@@ -223,7 +248,6 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
 
   // --- útdíj ---
   const tollBreakdown: TollBreakdownItem[] = [];
-  const rateOf = new Map<string, number>();
   for (const [cc, a] of perCountry) {
     const rule = TOLL_RULES[cc];
     const name = COUNTRY_NAMES[cc] ?? cc;
@@ -231,12 +255,11 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
       tollBreakdown.push({ country: cc, tollKm: 0, perKm: 0, fixed: 0, total: 0, note: `${name}: nincs modellezett kamion-útdíj.`, roads: [], confidence: "none", asOf: "" });
       continue;
     }
-    const perKm = ratePerKm(rule, v);
-    rateOf.set(cc, perKm);
+    const perKm = a.tollKm > 0 ? a.cost / a.tollKm : ratePerKm(rule, v, "motorway", c.eurHuf);
     const fixed = a.km > 0 && rule.fixed ? fixedFee(rule, v) : 0;
     tollBreakdown.push({
       country: cc, tollKm: a.tollKm, perKm, fixed,
-      total: a.tollKm * perKm + fixed,
+      total: a.cost + fixed,
       note: `${rule.system}. ${rule.note}`,
       roads: [...(roadKm.get(cc)?.entries() ?? [])].sort((x, y) => y[1] - x[1]).slice(0, 5).map(([n]) => n),
       confidence: rule.confidence,
@@ -247,7 +270,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
   for (const sp of SPECIALS) {
     const km = specialKm.get(sp.id) ?? 0;
     if (km < sp.minKm) continue;
-    const fee = specialFee(sp, v);
+    const fee = specialFee(sp, v, km);
     specials.push({ id: sp.id, name: sp.name, country: sp.country, km, fee, modelled: !!sp.fees, note: sp.note, confidence: sp.confidence, asOf: sp.asOf });
   }
   const specialsTotalEur = specials.reduce((s, x) => s + x.fee, 0);
@@ -270,7 +293,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     const leave = wallClock(depMs, endH);
     return {
       country: vis.country, startKm: vis.startKm, km: vis.km, tollKm: vis.tollKm,
-      toll: vis.tollKm * (rateOf.get(vis.country) ?? 0),
+      toll: vis.cost,
       enter: iso(enter), leave: iso(leave),
     };
   });
@@ -359,5 +382,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
 export async function planRoutes(req: RouteRequest): Promise<RouteResult[]> {
   const { trips } = await routeRequest(req.waypoints, req.vehicle, req.options);
   const results = await Promise.all(trips.map((t, i) => analyseTrip(t, req, i)));
-  return results;
+  // a leggyorsabb (kamionos menetidő-modell szerint) legyen az első
+  results.sort((a, b) => a.drivingMin - b.drivingMin);
+  return results.map((r, i) => ({ ...r, id: i }));
 }

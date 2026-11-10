@@ -4,6 +4,8 @@ export interface Waypoint {
   lat: number;
   lon: number;
   label: string;
+  /** az útvonal húzásával létrejött áthaladási pont (nem megálló) */
+  via?: boolean;
 }
 
 export type EuroClass = "euro6" | "euro5" | "euro4" | "older";
