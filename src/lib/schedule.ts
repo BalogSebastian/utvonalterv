@@ -1,8 +1,8 @@
-import { banWarnings } from "./bans";
+import { banEndAt, banWarnings, nextBanStart, TZ_OFFSET } from "./bans";
 import { COUNTRY_NAMES } from "./country-names";
-import type { BanWarning, LngLat, RouteResult, TripStop } from "./types";
+import type { BanWarning, CostInputs, LngLat, RouteOptions, RouteResult, TripStop } from "./types";
 
-/** A felhasználó által szerkeszthető megálló: kávészünet vagy napi pihenő. */
+/** A felhasználó által szerkeszthető megálló: szünet vagy napi pihenő. */
 export interface PlanStop {
   id: string;
   kind: "break" | "rest";
@@ -10,16 +10,23 @@ export interface PlanStop {
   f: number;
   /** ha meg van adva: a megálló egy valós helyhez [lng,lat] kötött (köztes pont az útvonalon) */
   anchor?: LngLat;
+  /** csökkentett (9 órás) napi pihenő */
+  reduced?: boolean;
+  /** valós kamionparkoló, ahová a megállót illesztettük */
+  place?: string;
 }
 
 const BREAK_H = 0.75;
 const REST_H = 11;
+const REDUCED_REST_H = 9;
 const MAX_CONT_H = 4.5;
 const MAX_DAY_H = 9;
+const EXT_DAY_H = 10;
+const H_MS = 3600_000;
 
-export function defaultStops(route: RouteResult): PlanStop[] {
-  return route.stops.map((s) => ({ id: s.id, kind: s.kind, f: s.f }));
-}
+type SchedOpts = Pick<RouteOptions, "departure" | "flexRules" | "waitBans">;
+
+/* ---------- geometria ---------- */
 
 /** Az útvonal geometriájának kumulatív hossza (km, közelítő). */
 export function cumulative(geometry: LngLat[]): number[] {
@@ -78,101 +85,299 @@ export function pointAtFraction(geometry: LngLat[], cum: number[], f: number): L
   return [ax + (bx - ax) * t, ay + (by - ay) * t];
 }
 
+/* ---------- idő-profil ---------- */
+
+/** vezetési óra az f arányig */
+export function hoursAt(route: RouteResult, f: number): number {
+  const p = route.profile;
+  if (!p?.length) return f * (route.drivingMin / 60);
+  if (f <= p[0][0]) return p[0][1];
+  let lo = 0;
+  let hi = p.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (p[mid][0] < f) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === 0) return p[0][1];
+  const [f0, h0] = p[lo - 1];
+  const [f1, h1] = p[lo];
+  return f1 > f0 ? h0 + ((f - f0) / (f1 - f0)) * (h1 - h0) : h1;
+}
+
+/** az első f arány, ahol a vezetési idő eléri h-t */
+export function fractionAtHours(route: RouteResult, h: number): number {
+  const p = route.profile;
+  if (!p?.length) return Math.min(1, h / ((route.drivingMin / 60) || 1));
+  if (h <= p[0][1]) return p[0][0];
+  for (let i = 1; i < p.length; i++) {
+    if (p[i][1] >= h) {
+      const [f0, h0] = p[i - 1];
+      const [f1, h1] = p[i];
+      return h1 > h0 ? f0 + ((h - h0) / (h1 - h0)) * (f1 - f0) : f0;
+    }
+  }
+  return 1;
+}
+
 const iso = (ms: number) => new Date(ms).toISOString().slice(0, 16);
 
+/* ---------- szimuláció ---------- */
+
+interface Seg { f0: number; f1: number; t0: number; t1: number; h0: number; ferry: boolean }
+
+interface SimOut {
+  stops: TripStop[];
+  plan: PlanStop[];
+  segs: Seg[];
+  arrival: number;
+  breaks: number;
+  rests: number;
+  waitH: number;
+  ferryH: number;
+  waitedIn: Set<string>;
+  hardWarnings: string[];
+  extUsed: number;
+  reducedUsed: number;
+}
+
 /**
- * A szerkesztett megállók alapján újraszámolja a menetrendet, az országonkénti
- * áthaladási időket, a tilalmi figyelmeztetéseket és a sofőrköltséget.
+ * Menetrend-szimuláció az útvonal mentén. `plan` = null: automatikus tervezés
+ * (szünetek / pihenők a legkorábbi jogszerű érkezéshez), különben a megadott megállókkal.
  */
-export function applyPlan(
-  route: RouteResult,
-  plan: PlanStop[],
-  departure: string,
-  vehicleWeight: number,
-  driverHourly: number,
-): RouteResult {
-  const depMs = Date.parse(`${departure}:00Z`);
-  if (!Number.isFinite(depMs)) return route;
-
-  const drivingH = route.drivingMin / 60;
+function simulate(route: RouteResult, plan: PlanStop[] | null, o: SchedOpts, weight: number): SimOut | null {
+  const depMs = Date.parse(`${o.departure}:00Z`);
+  if (!Number.isFinite(depMs)) return null;
+  const flex = o.flexRules !== false;
+  const waitBans = o.waitBans !== false;
+  const hTotal = hoursAt(route, 1);
+  const total = route.distanceKm || 1;
   const cum = cumulative(route.geometry);
-  const sorted = plan
-    .map((st) => (st.anchor ? { ...st, f: snapToRoute(route.geometry, cum, st.anchor).f } : st))
-    .sort((a, b) => a.f - b.f);
 
-  // --- szimuláció ---
+  // országhatárok arányban
+  const bounds = route.countries.map((c) => ({ cc: c.country, f0: c.startKm / total, f1: Math.min(1, (c.startKm + c.km) / total) }));
+  const countryAtF = (f: number) => {
+    const hit = bounds.find((b) => f >= b.f0 - 1e-9 && f < b.f1 - 1e-9);
+    if (hit) return hit.cc;
+    // komp alatt / határréseken: az előző ország
+    let prev = bounds[0];
+    for (const b of bounds) if (b.f0 <= f) prev = b;
+    return prev?.cc ?? "??";
+  };
+  const nextBoundary = (f: number) => {
+    for (const b of bounds) if (b.f1 > f + 1e-9) return b.f1;
+    return 1;
+  };
+
   let t = depMs;
-  let prevF = 0;
+  let f = 0;
   let sinceBreak = 0;
-  let sinceRest = 0;
+  let dayDrive = 0;
+  let dayLimit = MAX_DAY_H;
   let breaks = 0;
   let rests = 0;
+  let waitH = 0;
+  let ferryH = 0;
+  let extUsed = 0;
+  let reducedUsed = 0;
+  const waitedIn = new Set<string>();
   const hardWarnings: string[] = [];
-  const segs: { f0: number; f1: number; t0: number }[] = [];
+  const segs: Seg[] = [];
   const stops: TripStop[] = [];
+  const outPlan: PlanStop[] = [];
+
+  const mkStop = (id: string, kind: TripStop["kind"], durH: number, extra: Partial<TripStop> = {}): TripStop => {
+    const pt = pointAtFraction(route.geometry, cum, f);
+    return {
+      id, kind, f, atH: hoursAt(route, f), km: f * total, lon: pt[0], lat: pt[1],
+      country: countryAtF(Math.min(f, 0.999999)), time: iso(t), day: rests + 1, durH, ...extra,
+    };
+  };
 
   const checkSeg = (): string | undefined => {
+    // 10 órás nap (hetente legfeljebb 2×) a kézi tervben is
+    if (flex && dayLimit === MAX_DAY_H && dayDrive > MAX_DAY_H + 0.02 && dayDrive <= EXT_DAY_H + 0.02 && extUsed < 2) { dayLimit = EXT_DAY_H; extUsed++; }
     const msgs: string[] = [];
-    if (sinceBreak > MAX_CONT_H + 0.01) msgs.push(`${sinceBreak.toFixed(1)} óra megszakítás nélküli vezetés (max. 4,5 óra)`);
-    if (sinceRest > MAX_DAY_H + 0.01) msgs.push(`${sinceRest.toFixed(1)} óra napi vezetés (max. 9 óra, hetente 2× 10 óra)`);
+    if (sinceBreak > MAX_CONT_H + 0.02) msgs.push(`${sinceBreak.toFixed(1)} óra megszakítás nélküli vezetés (max. 4,5 óra)`);
+    if (dayDrive > dayLimit + 0.02) msgs.push(`${dayDrive.toFixed(1)} óra napi vezetés (max. ${dayLimit} óra${dayLimit < EXT_DAY_H ? ", hetente 2× 10 óra" : ""})`);
     return msgs.length ? msgs.join("; ") : undefined;
   };
 
-  sorted.forEach((st) => {
-    const drive = (st.f - prevF) * drivingH;
-    segs.push({ f0: prevF, f1: st.f, t0: t });
-    t += drive * 3600_000;
-    sinceBreak += drive;
-    sinceRest += drive;
+  /** várakozás (tilalom): a pihenőidő-számlálókat is nullázhatja */
+  const doWait = (until: number, cc: string) => {
+    const dh = (until - t) / H_MS;
+    if (dh <= 0) return;
+    stops.push(mkStop(`w${stops.length}`, "wait", dh, { warn: undefined, place: `Tilalom kivárása – ${COUNTRY_NAMES[cc] ?? cc}` }));
+    waitedIn.add(cc);
+    waitH += dh;
+    t = until;
+    if (dh >= REDUCED_REST_H) { sinceBreak = 0; dayDrive = 0; dayLimit = MAX_DAY_H; rests++; }
+    else if (dh >= BREAK_H) sinceBreak = 0;
+  };
+
+  /** vezetés fTarget-ig (országhatárokon és tilalmakon megállva) */
+  const driveTo = (fTarget: number) => {
+    let guard = 0;
+    while (f < fTarget - 1e-9 && guard++ < 500) {
+      const cc = countryAtF(f);
+      if (waitBans) {
+        const end = banEndAt(cc, t, weight);
+        // a célpont előtt közvetlenül (utolsó ~15 perc) nem várunk – a rakodóhelyre be lehet érni
+        if (end && hTotal - hoursAt(route, f) > 0.25) { doWait(end, cc); continue; }
+      }
+      const fc = Math.min(fTarget, nextBoundary(f));
+      const h0 = hoursAt(route, f);
+      let dh = hoursAt(route, fc) - h0;
+      let fEnd = fc;
+      if (waitBans && dh > 0) {
+        const tb = nextBanStart(cc, t, t + dh * H_MS, weight);
+        if (tb && hTotal - h0 - (tb - t) / H_MS > 0.25) {
+          dh = (tb - t) / H_MS;
+          fEnd = Math.min(fc, fractionAtHours(route, h0 + dh));
+        }
+      }
+      segs.push({ f0: f, f1: fEnd, t0: t, t1: t + dh * H_MS, h0, ferry: false });
+      t += dh * H_MS;
+      sinceBreak += dh;
+      dayDrive += dh;
+      if (fEnd <= f + 1e-12 && dh <= 0) {
+        // nincs előrehaladás (pl. tilalom kezdetén): várakozás következik
+        if (waitBans) { const end = banEndAt(cc, t + 1000, weight); if (end) { doWait(end, cc); continue; } }
+        f = fc;
+      } else f = fEnd;
+    }
+  };
+
+  const doBreak = (id: string, place?: string) => {
     const warn = checkSeg();
     if (warn) hardWarnings.push(warn);
-    const arrive = t;
-    if (st.kind === "break") {
-      breaks++;
-      t += BREAK_H * 3600_000;
-      sinceBreak = 0;
-    } else {
-      rests++;
-      t += REST_H * 3600_000;
-      sinceBreak = 0;
-      sinceRest = 0;
+    stops.push(mkStop(id, "break", BREAK_H, { warn, place }));
+    breaks++;
+    t += BREAK_H * H_MS;
+    sinceBreak = 0;
+  };
+  const doRest = (id: string, reducedWanted: boolean, place?: string) => {
+    const warn = checkSeg();
+    if (warn) hardWarnings.push(warn);
+    const reduced = reducedWanted && reducedUsed < 3;
+    if (reduced) reducedUsed++;
+    const dur = reduced ? REDUCED_REST_H : REST_H;
+    stops.push(mkStop(id, "rest", dur, { warn, place: place ?? (reduced ? "Csökkentett (9 órás) napi pihenő" : undefined) }));
+    rests++;
+    t += dur * H_MS;
+    sinceBreak = 0;
+    dayDrive = 0;
+    dayLimit = MAX_DAY_H;
+    return reduced;
+  };
+  const doFerry = (fr: RouteResult["ferries"][number]) => {
+    const dur = fr.checkInH + fr.durationH;
+    const t0 = t;
+    t += dur * H_MS;
+    ferryH += dur;
+    segs.push({ f0: fr.f0, f1: fr.f1, t0, t1: t, h0: hoursAt(route, fr.f0), ferry: true });
+    const restOnBoard = fr.berth && dur >= REST_H;
+    stops.push({ ...mkStop(`f${fr.id}`, "ferry", dur), place: `${fr.kind === "rail" ? "🚆" : "⛴"} ${fr.from} → ${fr.to}${restOnBoard ? " · napi pihenő a fedélzeten (fekhely)" : dur >= BREAK_H ? " · szünetnek számít" : ""}` });
+    if (restOnBoard) { sinceBreak = 0; dayDrive = 0; dayLimit = MAX_DAY_H; rests++; }
+    else if (dur >= BREAK_H) sinceBreak = 0;
+    f = fr.f1;
+  };
+
+  const ferries = [...(route.ferries ?? [])].sort((a, b) => a.f0 - b.f0);
+
+  if (plan) {
+    // --- a megadott megállókkal ---
+    type Ev = { f: number; stop?: PlanStop; ferry?: RouteResult["ferries"][number] };
+    const evs: Ev[] = [
+      ...plan.map((st): Ev => ({ f: st.anchor ? snapToRoute(route.geometry, cum, st.anchor).f : st.f, stop: st })),
+      ...ferries.map((fr): Ev => ({ f: fr.f0, ferry: fr })),
+    ].sort((a, b) => a.f - b.f || (a.ferry ? 1 : -1));
+    for (const ev of evs) {
+      if (ev.f < f - 1e-9) continue; // kompon belüli megálló: kihagyva
+      driveTo(ev.f);
+      if (ev.ferry) { doFerry(ev.ferry); continue; }
+      const st = ev.stop!;
+      const before = stops.length;
+      if (st.kind === "break") doBreak(st.id, st.place);
+      else doRest(st.id, !!st.reduced && flex, st.place);
+      const s = stops[before];
+      if (s) s.anchored = !!st.anchor;
+      outPlan.push({ ...st, f: ev.f });
     }
-    const pt = pointAtFraction(route.geometry, cum, st.f);
-    const km = st.f * route.distanceKm;
-    const leg = route.countries.find((c) => km >= c.startKm && km <= c.startKm + c.km) ?? route.countries[route.countries.length - 1];
-    stops.push({
-      id: st.id, anchored: !!st.anchor, kind: st.kind, f: st.f, atH: st.f * drivingH, km, lon: pt[0], lat: pt[1],
-      country: leg?.country ?? "??", time: iso(arrive), day: rests + (st.kind === "rest" ? 0 : 1),
-      warn,
-    });
-    prevF = st.f;
-  });
-  // utolsó szakasz a célig
-  {
-    const drive = (1 - prevF) * drivingH;
-    segs.push({ f0: prevF, f1: 1, t0: t });
-    t += drive * 3600_000;
-    sinceBreak += drive;
-    sinceRest += drive;
+    driveTo(1);
     const warn = checkSeg();
     if (warn) hardWarnings.push(`Az utolsó szakaszon: ${warn}`);
+  } else {
+    // --- automatikus tervezés ---
+    let fi = 0;
+    let n = 0;
+    while (f < 1 - 1e-9 && n++ < 400) {
+      const hNow = hoursAt(route, f);
+      const remaining = hTotal - hNow;
+      const nextFerry = ferries[fi];
+      const hFerry = nextFerry ? hoursAt(route, nextFerry.f0) : Infinity;
+      // 10 órás nap (hetente 2×): ha így elérjük a célt vagy a kompot
+      if (flex && extUsed < 2 && dayLimit === MAX_DAY_H) {
+        const reach = Math.min(remaining, hFerry - hNow);
+        if (dayDrive + reach > MAX_DAY_H + 0.01 && dayDrive + reach <= EXT_DAY_H) { dayLimit = EXT_DAY_H; extUsed++; }
+      }
+      const hBreak = hNow + (MAX_CONT_H - sinceBreak);
+      const hDay = hNow + (dayLimit - dayDrive);
+      const hStop = Math.min(hBreak, hDay);
+      if (hFerry <= hStop + 1e-9 && hFerry <= hTotal) {
+        driveTo(nextFerry.f0);
+        doFerry(nextFerry);
+        fi++;
+        continue;
+      }
+      if (hStop >= hTotal - 1e-6) { driveTo(1); break; }
+      const fStop = fractionAtHours(route, hStop);
+      const restsBefore = rests;
+      driveTo(fStop);
+      // a vezetés közben tilalom miatti várakozás volt: újratervezés innen
+      if (rests !== restsBefore || hoursAt(route, f) < hStop - 1e-3) continue;
+      const id = `a${outPlan.length}`;
+      if (hDay <= hBreak + 1e-6) {
+        const reduced = doRest(id, flex);
+        outPlan.push({ id, kind: "rest", f, reduced });
+      } else {
+        doBreak(id);
+        outPlan.push({ id, kind: "break", f });
+      }
+    }
   }
-  const arrival = t;
 
-  // nap sorszám a megállókhoz (pihenők után új nap)
+  // nap sorszám
   let day = 1;
   for (const st of stops) {
     st.day = day;
-    if (st.kind === "rest") day++;
+    if (st.kind === "rest" || (st.kind === "wait" && (st.durH ?? 0) >= REDUCED_REST_H) || (st.kind === "ferry" && st.place?.includes("napi pihenő"))) day++;
   }
+  return { stops, plan: outPlan, segs, arrival: t, breaks, rests, waitH, ferryH, waitedIn, hardWarnings, extUsed, reducedUsed };
+}
+
+/** automatikus szünet- és pihenőterv (EU 561/2006, a legkorábbi jogszerű érkezéshez) */
+export function autoPlan(route: RouteResult, o: SchedOpts, weight: number): PlanStop[] {
+  return simulate(route, null, o, weight)?.plan ?? [];
+}
+
+/**
+ * A megállók alapján újraszámolja a menetrendet, az országonkénti áthaladási időket,
+ * a tilalmakat, a sofőr- és a napi költségeket, valamint a teljes költséget.
+ */
+export function applyPlan(route: RouteResult, plan: PlanStop[], o: SchedOpts, weight: number, costs: CostInputs): RouteResult {
+  const sim = simulate(route, plan, o, weight);
+  if (!sim) return route;
+  const depMs = Date.parse(`${o.departure}:00Z`);
+  const total = route.distanceKm || 1;
 
   const wall = (f: number): number => {
-    const seg = segs.find((s) => f <= s.f1 + 1e-9) ?? segs[segs.length - 1];
-    return seg.t0 + (f - seg.f0) * drivingH * 3600_000;
+    const seg = sim.segs.find((s) => f >= s.f0 - 1e-9 && f <= s.f1 + 1e-9 && s.f1 > s.f0) ?? sim.segs[sim.segs.length - 1];
+    if (!seg) return depMs;
+    if (seg.ferry) return seg.t0 + ((f - seg.f0) / (seg.f1 - seg.f0 || 1)) * (seg.t1 - seg.t0);
+    return seg.t0 + (hoursAt(route, f) - seg.h0) * H_MS;
   };
 
-  // --- országok ideje + tilalmak ---
-  const total = route.distanceKm || 1;
   const countries = route.countries.map((c) => {
     const f0 = c.startKm / total;
     const f1 = Math.min(1, (c.startKm + c.km) / total);
@@ -180,28 +385,40 @@ export function applyPlan(
   });
   const bans = banWarnings(
     countries.map((c) => ({ country: c.country, enter: Date.parse(`${c.enter}:00Z`), leave: Date.parse(`${c.leave}:00Z`) })),
-    vehicleWeight,
+    weight,
+    sim.waitedIn,
   );
-  const ruleWarnings: BanWarning[] = hardWarnings.map((text) => ({ country: "EU", severity: "danger", text: `Pihenőidő-szabály (EU 561/2006): ${text}.` }));
-  // az időtartam alapú napi bontás összegzése
-  const totalH = (arrival - depMs) / 3600_000;
-  const workH = drivingH + breaks * BREAK_H;
-  const driverCostEur = workH * driverHourly;
+  const drivingH = hoursAt(route, 1);
+  const ruleWarnings: BanWarning[] = sim.hardWarnings.map((text) => ({ country: "EU", severity: "danger", text: `Pihenőidő-szabály (EU 561/2006): ${text}.` }));
+  if (drivingH > 56) ruleWarnings.push({ country: "EU", severity: "warn", text: `A vezetési idő (${drivingH.toFixed(1)} óra) meghaladja a heti 56 órát – két sofőr vagy heti pihenő szükséges.` });
+  const totalH = (sim.arrival - depMs) / H_MS;
+  if (totalH > 6 * 24) ruleWarnings.push({ country: "EU", severity: "warn", text: "Az út 6 napnál hosszabb: heti pihenőidő (45 / 24 óra) is szükséges – ez nincs betervezve." });
+
+  const calendarDays = Math.max(1, Math.ceil(totalH / 24 - 1e-6));
+  const workH = drivingH + sim.breaks * BREAK_H + sim.waitH * 0 + (route.ferries ?? []).reduce((s, f) => s + f.checkInH, 0);
+  const driverCostEur = workH * costs.driverHourly + calendarDays * (costs.driverDaily ?? 0);
+  const vehicleCostEur = (route.roadKm ?? route.distanceKm) * costs.vehicleKm + calendarDays * (costs.vehicleDaily ?? 0);
+  const last = countries[countries.length - 1]?.country;
+  const off = last ? TZ_OFFSET[last] ?? 0 : 0;
 
   return {
     ...route,
     countries,
-    stops,
+    stops: sim.stops,
     warnings: [...ruleWarnings, ...bans],
     schedule: {
-      drivingH, breaks45: breaks, dailyRests: rests, totalH, days: rests + 1, arrival: iso(arrival),
+      drivingH, breaks45: sim.breaks, dailyRests: sim.rests, totalH, days: calendarDays,
+      arrival: iso(sim.arrival),
+      arrivalLocal: off ? iso(sim.arrival + off * H_MS) : undefined,
+      waitH: sim.waitH, ferryH: sim.ferryH,
     },
     driverCostEur,
-    totalEur: route.tollTotalEur + route.fuelCostEur + driverCostEur + route.vehicleCostEur,
+    vehicleCostEur,
+    totalEur: route.tollTotalEur + (route.ferryTotalEur ?? 0) + route.fuelCostEur + driverCostEur + vehicleCostEur,
   };
 }
 
-/** Új megálló a legnagyobb "lyuk" közepére (az utolsó megálltól/céltól mért leghosszabb szakaszra). */
+/** Új megálló a legnagyobb "lyuk" közepére. */
 export function addStop(plan: PlanStop[], kind: "break" | "rest"): PlanStop[] {
   const fs = [0, ...plan.map((p) => p.f).sort((a, b) => a - b), 1];
   let best = 0;

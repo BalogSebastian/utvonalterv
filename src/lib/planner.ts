@@ -1,13 +1,16 @@
 import { COUNTRY_NAMES, countryAt } from "./countries";
-import { banWarnings } from "./bans";
 import { decodePolyline, encodePolyline } from "./polyline";
 import { TOLL_RULES, fixedFee, isTolledEdge, ratePerKm } from "./tolls";
 import { SPECIALS, specialFee } from "./specials";
+import { ferryPath, ferryPrice, matchFerry, pathKm, splitByFerries, type FerryLine } from "./ferries";
+import { buildZones, inZone } from "./zones";
+import { applyPlan, autoPlan } from "./schedule";
+import { DEFAULT_COSTS } from "./presets";
 import {
-  routeRequest, traceEdges, type VLeg, type VTrip,
+  routeRequest, traceEdges, type Excl, type VLeg, type VTrip,
 } from "./valhalla";
 import type {
-  CountryLeg, DriveSchedule, LngLat, RouteRequest, RouteResult, TollBreakdownItem, TripStop, SpecialItem,
+  CountryLeg, FerryLeg, LngLat, RouteRequest, RouteResult, TimeProfile, TollBreakdownItem, SpecialItem,
 } from "./types";
 
 interface EdgeLike {
@@ -23,6 +26,8 @@ interface EdgeLike {
   /** index range a geometria pontjaiban (tollGeometry-hez) */
   i0: number;
   i1: number;
+  /** komp / autós vonat él */
+  ferry?: boolean;
 }
 
 /** Közel egymás melletti pontok ritkítása a térképes megjelenítéshez (~12 m). */
@@ -41,41 +46,6 @@ function thin(coords: LngLat[]): LngLat[] {
   out.push(coords[coords.length - 1]);
   return out;
 }
-
-/** EU 561/2006: 9 óra vezetés / nap, 45 perc szünet 4,5 óra után, 11 óra napi pihenő. */
-const DAY_DRIVE_H = 9;
-const BREAK_H = 0.75;
-const REST_H = 11;
-
-export function schedule(drivingH: number, departureMs: number): DriveSchedule {
-  let rem = drivingH;
-  let breaks = 0;
-  let days = 0;
-  let totalH = 0;
-  while (rem > 1e-6) {
-    const day = Math.min(DAY_DRIVE_H, rem);
-    days++;
-    const b = Math.max(0, Math.ceil(day / 4.5 - 1e-9) - 1);
-    breaks += b;
-    totalH += day + b * BREAK_H;
-    rem -= day;
-    if (rem > 1e-6) totalH += REST_H;
-  }
-  return {
-    drivingH, breaks45: breaks, dailyRests: Math.max(0, days - 1), totalH, days,
-    arrival: new Date(departureMs + totalH * 3600_000).toISOString().slice(0, 16),
-  };
-}
-
-/** vezetési idő (h) -> falióra-idő (ms), szünetekkel és pihenőkkel */
-function wallClock(departureMs: number, drivingH: number): number {
-  const full = Math.floor(drivingH / DAY_DRIVE_H + 1e-9);
-  const rem = drivingH - full * DAY_DRIVE_H;
-  let h = full * (DAY_DRIVE_H + BREAK_H + REST_H);
-  h += rem + (rem > 4.5 ? BREAK_H : 0);
-  return departureMs + h * 3600_000;
-}
-
 
 /** az út legjobb megnevezése: útszám (M1, A4, D2, S16…), nem az E-szám vagy utcanév */
 function refName(names?: string[]): string | undefined {
@@ -128,6 +98,7 @@ async function legEdges(
     );
     results.push(...(await Promise.allSettled(batch)));
   }
+  // a ferry élek a 'use' mezőből jönnek; manőver-szinten a típus (28/29 = komp be/ki)
   chunks.forEach((c, ci) => {
     const t = results[ci];
     if (t.status === "fulfilled" && t.value.edges?.length) {
@@ -136,8 +107,9 @@ async function legEdges(
       for (const e of t.value.edges) {
         const ai = e.end_node?.admin_index;
         const cc = ai !== undefined ? admins[ai]?.country_code : undefined;
+        const ferry = e.use === "ferry" || e.use === "rail-ferry";
         edges.push({
-          km: e.length, toll: !!e.toll, roadClass: e.road_class, name: refName(e.names), names: e.names, cc: cc || undefined,
+          ferry, km: e.length, toll: !!e.toll, roadClass: e.road_class, name: refName(e.names), names: e.names, cc: cc || undefined,
           a: sh[e.begin_shape_index], b: sh[e.end_shape_index],
           i0: c.from + e.begin_shape_index, i1: c.from + e.end_shape_index,
         });
@@ -146,7 +118,7 @@ async function legEdges(
       exact = false;
       for (const m of c.ms) {
         edges.push({
-          km: m.length, toll: !!m.toll, roadClass: m.highway ? "motorway" : undefined, name: m.street_names?.[0],
+          ferry: !!m.ferry, km: m.length, toll: !!m.toll, roadClass: m.highway ? "motorway" : undefined, name: m.street_names?.[0],
           a: coords[m.begin_shape_index], b: coords[m.end_shape_index],
           i0: m.begin_shape_index, i1: m.end_shape_index,
         });
@@ -156,22 +128,58 @@ async function legEdges(
   return { coords, edges, exact };
 }
 
-async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<RouteResult> {
-  const { vehicle: v, costs: c, options: o } = req;
-  const legs: VLeg[] = trip.legs;
+/** egy útvonal-rész: közúti (Valhalla) vagy kiválasztott komp / vasúti járat */
+type Part = { kind: "road"; trip: VTrip } | { kind: "ferry"; line: FerryLine; reverse: boolean };
+
+const CONF_WEIGHT = { official: 0.99, source: 0.95, estimate: 0.8, none: 0.7 } as const;
+
+async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable: string[]): Promise<RouteResult> {
+  const { vehicle: v, costs: c0, options: o } = req;
+  const c = { ...DEFAULT_COSTS, ...c0 };
+  const depMs = Date.parse(`${o.departure}:00Z`);
 
   // --- geometria + élek ---
   const fullCoords: LngLat[] = [];
   const edges: EdgeLike[] = [];
   let accuracy: "edge" | "maneuver" = "edge";
+  let valhallaRoadMin = 0;
+  const chosen: { line: FerryLine; reverse: boolean; i0: number; i1: number }[] = [];
+  const maneuvers: RouteResult["maneuvers"] = [];
 
-  for (const leg of legs) {
-    const r = await legEdges(leg, v, o);
-    if (!r.exact) accuracy = "maneuver";
+  for (const part of parts) {
     const base = fullCoords.length ? fullCoords.length - 1 : 0;
-    for (const e of r.edges) edges.push({ ...e, i0: e.i0 + base, i1: e.i1 + base });
-    fullCoords.push(...(fullCoords.length ? r.coords.slice(1) : r.coords));
+    if (part.kind === "ferry") {
+      const path = ferryPath(part.line, part.reverse);
+      const km = pathKm(path);
+      edges.push({ ferry: true, km, toll: false, roadClass: "ferry", a: path[0], b: path[path.length - 1], i0: base, i1: base + path.length - 1 });
+      chosen.push({ ...part, i0: base, i1: base + path.length - 1 });
+      fullCoords.push(...(fullCoords.length ? path.slice(1) : path));
+      const dep = part.reverse ? part.line.b : part.line.a;
+      const arr = part.reverse ? part.line.a : part.line.b;
+      maneuvers.push({ text: `${part.line.kind === "rail" ? "🚆" : "⛴"} ${part.line.name}: ${dep.name} → ${arr.name} (${part.line.operator})`, km, min: part.line.durationH * 60 });
+      continue;
+    }
+    valhallaRoadMin += part.trip.summary.time / 60;
+    for (const leg of part.trip.legs) {
+      const b0 = fullCoords.length ? fullCoords.length - 1 : 0;
+      const r = await legEdges(leg, v, o);
+      if (!r.exact) accuracy = "maneuver";
+      for (const e of r.edges) edges.push({ ...e, i0: e.i0 + b0, i1: e.i1 + b0 });
+      fullCoords.push(...(fullCoords.length ? r.coords.slice(1) : r.coords));
+      maneuvers.push(...leg.maneuvers.map((m) => ({ text: m.instruction, km: m.length, min: m.time / 60, street: m.street_names?.[0] })));
+    }
   }
+
+  // --- geometriai arány (0..1) a pontokhoz ---
+  const cumG: number[] = [0];
+  for (let i = 1; i < fullCoords.length; i++) {
+    const [x1, y1] = fullCoords[i - 1];
+    const [x2, y2] = fullCoords[i];
+    const dx = (x2 - x1) * Math.cos(((y1 + y2) / 2) * (Math.PI / 180)) * 111.32;
+    cumG.push(cumG[i - 1] + Math.hypot(dx, (y2 - y1) * 110.57));
+  }
+  const geoKm = cumG[cumG.length - 1] || 1;
+  const fAt = (i: number) => Math.min(1, cumG[Math.min(i, cumG.length - 1)] / geoKm);
 
   // --- országok, díjköteles km-ek ---
   let curCountry = countryAt(fullCoords[0]) ?? "??";
@@ -180,15 +188,32 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
   const tollRuns: [number, number][] = [];
   let cumKm = 0;
   let totalKm = 0;
-  for (const e of edges) totalKm += e.km;
+  let roadKm = 0;
+  for (const e of edges) { totalKm += e.km; if (!e.ferry) roadKm += e.km; }
 
   const perCountry = new Map<string, { km: number; tollKm: number; cost: number }>();
-  const roadKm = new Map<string, Map<string, number>>();
+  const roadKmBy = new Map<string, Map<string, number>>();
   const specialKm = new Map<string, number>();
+  const zones = buildZones(o.noGo);
+  const zoneKm = new Map<string, number>();
+  const autoFerries: { i0: number; i1: number; km: number }[] = [];
   for (const e of edges) {
+    if (e.ferry) {
+      // a routing által választott (nem a felhasználó által kijelölt) komp
+      if (!chosen.some((x) => e.i0 >= x.i0 && e.i1 <= x.i1)) {
+        const last = autoFerries[autoFerries.length - 1];
+        if (last && last.i1 === e.i0) { last.i1 = e.i1; last.km += e.km; }
+        else autoFerries.push({ i0: e.i0, i1: e.i1, km: e.km });
+      }
+      cumKm += e.km;
+      continue;
+    }
     const mid: LngLat = [(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2];
     const cc = e.cc ?? countryAt(mid) ?? countryAt(e.a) ?? curCountry;
     curCountry = cc;
+    for (const z of zones) {
+      if (z.country ? z.country === cc : inZone(z, mid)) zoneKm.set(z.id, (zoneKm.get(z.id) ?? 0) + e.km);
+    }
     let replaced = false;
     if (e.names?.length) {
       for (const sp of SPECIALS) {
@@ -199,7 +224,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     }
     const rule = TOLL_RULES[cc];
     const tolled = rule ? isTolledEdge(rule, e.roadClass, e.toll) : false;
-    const cost = tolled && rule && !replaced ? e.km * ratePerKm(rule, v, e.roadClass, c.eurHuf) : 0;
+    const cost = tolled && rule && !replaced ? e.km * ratePerKm(rule, v, e.roadClass, c.eurHuf, mid, depMs) : 0;
     let last = visits[visits.length - 1];
     if (!last || last.country !== cc) {
       last = { country: cc, km: 0, tollKm: 0, startKm: cumKm, cost: 0 };
@@ -214,9 +239,9 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
       agg.tollKm += e.km;
       agg.cost += cost;
       if (e.name) {
-        const m = roadKm.get(cc) ?? new Map<string, number>();
+        const m = roadKmBy.get(cc) ?? new Map<string, number>();
         m.set(e.name, (m.get(e.name) ?? 0) + e.km);
-        roadKm.set(cc, m);
+        roadKmBy.set(cc, m);
       }
       const lastRun = tollRuns[tollRuns.length - 1];
       if (lastRun && lastRun[1] === e.i0) lastRun[1] = e.i1;
@@ -226,8 +251,7 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     cumKm += e.km;
   }
 
-  // határ menti "villogás" kisimítása: a rövid (<8 km) szakaszt beolvasztjuk a szomszédjába,
-  // ha az előtte és utána lévő ország ugyanaz (pl. Komárom/Komárno), különben a nagyobb szomszédba.
+  // határ menti "villogás" kisimítása: a rövid (<8 km) szakaszt beolvasztjuk, ha előtte és utána ugyanaz az ország
   for (let changed = true; changed; ) {
     changed = false;
     for (let i = 0; i < visits.length; i++) {
@@ -252,16 +276,16 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
     const rule = TOLL_RULES[cc];
     const name = COUNTRY_NAMES[cc] ?? cc;
     if (!rule) {
-      tollBreakdown.push({ country: cc, tollKm: 0, perKm: 0, fixed: 0, total: 0, note: `${name}: nincs modellezett kamion-útdíj.`, roads: [], confidence: "none", asOf: "" });
+      tollBreakdown.push({ country: cc, tollKm: 0, perKm: 0, fixed: 0, total: 0, note: `${name}: nincs kamion-útdíj (vagy nincs modellezve).`, roads: [], confidence: "none", asOf: "" });
       continue;
     }
-    const perKm = a.tollKm > 0 ? a.cost / a.tollKm : ratePerKm(rule, v, "motorway", c.eurHuf);
-    const fixed = a.km > 0 && rule.fixed ? fixedFee(rule, v) : 0;
+    const perKm = a.tollKm > 0 ? a.cost / a.tollKm : rule.fixedFn ? 0 : ratePerKm(rule, v, "motorway", c.eurHuf, undefined, depMs);
+    const fixed = a.km > 0 && (rule.fixed || rule.fixedFn) ? fixedFee(rule, v) : 0;
     tollBreakdown.push({
       country: cc, tollKm: a.tollKm, perKm, fixed,
       total: a.cost + fixed,
       note: `${rule.system}. ${rule.note}`,
-      roads: [...(roadKm.get(cc)?.entries() ?? [])].sort((x, y) => y[1] - x[1]).slice(0, 5).map(([n]) => n),
+      roads: [...(roadKmBy.get(cc)?.entries() ?? [])].sort((x, y) => y[1] - x[1]).slice(0, 5).map(([n]) => n),
       confidence: rule.confidence,
       asOf: rule.asOf,
     });
@@ -275,114 +299,132 @@ async function analyseTrip(trip: VTrip, req: RouteRequest, id: number): Promise<
   }
   const specialsTotalEur = specials.reduce((s, x) => s + x.fee, 0);
   const tollTotalEur = tollBreakdown.reduce((s, t) => s + t.total, 0) + specialsTotalEur;
+  const tollKm = tollBreakdown.reduce((s, t) => s + t.tollKm, 0);
+  // becsült pontosság: a tarifák megbízhatóságával súlyozva
+  let wSum = 0;
+  let wConf = 0;
+  for (const t of tollBreakdown) { wSum += t.total; wConf += t.total * CONF_WEIGHT[t.confidence]; }
+  for (const sp of specials) {
+    const w = sp.modelled ? sp.fee : 150;
+    wSum += w;
+    wConf += w * (sp.modelled ? CONF_WEIGHT[sp.confidence] : 0.5);
+  }
+  let tollConfidence = wSum > 0 ? wConf / wSum : 1;
+  if (accuracy === "maneuver") tollConfidence *= 0.95;
 
-  // --- idő, szünetek ---
-  // Menetidő: kamionos átlagsebességek útosztályonként (a routingot nem torzítjuk sebességkorláttal,
-  // különben az autópálya nem lenne vonzóbb a főútnál). Ha nincs élszintű adat: a Valhalla ideje +20%.
-  const modelMin = edges.reduce((sum, e) => sum + (e.km / (TRUCK_SPEED[e.roadClass ?? ""] ?? 40)) * 60, 0);
-  const drivingMin = accuracy === "edge" ? modelMin : (trip.summary.time / 60) * 1.2;
-  const drivingH = drivingMin / 60;
-  const depMs = Date.parse(`${o.departure}:00Z`);
-  const sched = schedule(drivingH, Number.isFinite(depMs) ? depMs : Date.now());
-
-  const iso = (ms: number) => new Date(ms).toISOString().slice(0, 16);
-  const countries: CountryLeg[] = visits.map((vis) => {
-    const startH = (vis.startKm / (totalKm || 1)) * drivingH;
-    const endH = ((vis.startKm + vis.km) / (totalKm || 1)) * drivingH;
-    const enter = wallClock(depMs, startH);
-    const leave = wallClock(depMs, endH);
+  // --- kompok / vasúti járatok ---
+  const ferries: FerryLeg[] = [];
+  const legOf = (line: FerryLine | null, reverse: boolean, i0: number, i1: number, km: number): FerryLeg => {
+    const ov = line ? o.ferryOverrides?.[line.id] : undefined;
+    const dep = line ? (reverse ? line.b : line.a) : null;
+    const arr = line ? (reverse ? line.a : line.b) : null;
     return {
-      country: vis.country, startKm: vis.startKm, km: vis.km, tollKm: vis.tollKm,
-      toll: vis.cost,
-      enter: iso(enter), leave: iso(leave),
+      id: line?.id ?? `auto${i0}`,
+      name: line?.name ?? "Komp (a katalógusban nem szereplő járat)",
+      kind: line?.kind ?? "ferry",
+      from: dep?.name ?? "?", to: arr?.name ?? "?",
+      f0: fAt(i0), f1: fAt(i1), km,
+      durationH: ov?.durationH ?? line?.durationH ?? Math.max(0.5, km / 28),
+      checkInH: line?.checkInH ?? 1,
+      priceEur: line ? ferryPrice(line, v, ov, reverse) : 0,
+      berth: line?.berth ?? false,
+      priced: !line ? "estimate" : ov?.priceEur !== undefined ? "user" : "catalog",
+      note: line ? `${line.operator}. ${line.note}` : "A routing kompot választott, de a járat nincs a katalógusban – a díj nincs bekalkulálva. Válaszd ki a járatot a Komp / vasút kártyán.",
+      geometry: fullCoords.slice(i0, i1 + 1),
     };
-  });
-
-  // --- szünetek / napi pihenők helye a térképen ---
-  const cum: number[] = [0];
-  for (let i = 1; i < fullCoords.length; i++) {
-    const [x1, y1] = fullCoords[i - 1];
-    const [x2, y2] = fullCoords[i];
-    const dx = (x2 - x1) * Math.cos(((y1 + y2) / 2) * (Math.PI / 180)) * 111.32;
-    const dy = (y2 - y1) * 110.57;
-    cum.push(cum[i - 1] + Math.hypot(dx, dy));
-  }
-  const geoKm = cum[cum.length - 1] || 1;
-  const pointAt = (atH: number): { km: number; c: LngLat } => {
-    const target = Math.min(1, atH / (drivingH || 1)) * geoKm;
-    let lo = 0;
-    let hi = cum.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (cum[mid] < target) lo = mid + 1;
-      else hi = mid;
-    }
-    return { km: (target / geoKm) * trip.summary.length, c: fullCoords[lo] };
   };
-  const stops: TripStop[] = [];
-  for (let day = 0; day * DAY_DRIVE_H < drivingH - 0.05; day++) {
-    const dayStart = day * DAY_DRIVE_H;
-    const dayDrive = Math.min(DAY_DRIVE_H, drivingH - dayStart);
-    if (dayDrive > 4.5 + 0.05) {
-      const atH = dayStart + 4.5;
-      const pt = pointAt(atH);
-      stops.push({ id: `b${day}`, f: atH / (drivingH || 1), kind: "break", atH, km: pt.km, lon: pt.c[0], lat: pt.c[1], country: countryAt(pt.c) ?? "??", time: iso(wallClock(depMs, atH)), day: day + 1 });
-    }
-    if (dayStart + dayDrive < drivingH - 0.05) {
-      const atH = dayStart + dayDrive;
-      const pt = pointAt(atH);
-      stops.push({ id: `r${day}`, f: atH / (drivingH || 1), kind: "rest", atH, km: pt.km, lon: pt.c[0], lat: pt.c[1], country: countryAt(pt.c) ?? "??", time: iso(wallClock(depMs, atH)), day: day + 1 });
-    }
+  for (const x of chosen) ferries.push(legOf(x.line, x.reverse, x.i0, x.i1, edges.find((e) => e.ferry && e.i0 === x.i0)?.km ?? 0));
+  for (const x of autoFerries) {
+    const m = matchFerry(fullCoords[x.i0], fullCoords[x.i1]);
+    ferries.push(legOf(m?.line ?? null, m?.reverse ?? false, x.i0, x.i1, x.km));
   }
+  ferries.sort((a, b) => a.f0 - b.f0);
+  const ferryTotalEur = ferries.reduce((s, f) => s + f.priceEur, 0);
 
-  const warnings = Number.isFinite(depMs)
-    ? banWarnings(
-        countries.map((cl) => ({ country: cl.country, enter: Date.parse(`${cl.enter}:00Z`), leave: Date.parse(`${cl.leave}:00Z`) })),
-        v.weight,
-      )
-    : [];
+  // --- idő-profil: útvonal-arány → vezetési óra (kamionos sebességmodell útosztályonként) ---
+  // Ha nincs élszintű adat: a Valhalla ideje +20%.
+  const roadModelMin = edges.reduce((sum, e) => sum + (e.ferry ? 0 : (e.km / (TRUCK_SPEED[e.roadClass ?? ""] ?? 40)) * 60), 0);
+  const scale = accuracy === "edge" || !roadModelMin ? 1 : (valhallaRoadMin * 1.2) / roadModelMin;
+  const profile: TimeProfile = [[0, 0]];
+  let hAcc = 0;
+  let lastF = 0;
+  for (const e of edges) {
+    if (!e.ferry) hAcc += ((e.km / (TRUCK_SPEED[e.roadClass ?? ""] ?? 40)) * scale);
+    const f = fAt(e.i1);
+    if (f - lastF > 0.0015 || e.ferry) { profile.push([f, hAcc]); lastF = f; }
+  }
+  if (profile[profile.length - 1][0] < 1) profile.push([1, hAcc]);
+  const drivingMin = hAcc * 60;
 
-  // --- költség ---
-  const fuelLiters = (totalKm * v.consumption) / 100;
+  const countries: CountryLeg[] = visits.map((vis) => ({
+    country: vis.country, startKm: vis.startKm, km: vis.km, tollKm: vis.tollKm, toll: vis.cost, enter: "", leave: "",
+  }));
+
+  // --- No-Go zónák ellenőrzése (pontos, élszintű országadattal) ---
+  const noGo = zones
+    .map((z) => ({ name: z.name, km: zoneKm.get(z.id) ?? 0, unavoidable: unavoidable.includes(z.name) }))
+    .filter((z) => z.km > 0.5);
+
+  // --- közvetlen költségek (a sofőr és a napi költség a menetrendből jön: applyPlan) ---
+  const fuelLiters = (roadKm * v.consumption) / 100;
   const fuelCostEur = fuelLiters * c.fuelPrice;
-  const workH = sched.drivingH + sched.breaks45 * BREAK_H;
-  const driverCostEur = workH * c.driverHourly;
-  const vehicleCostEur = totalKm * c.vehicleKm;
-
   const tollGeometry = tollRuns.map(([i0, i1]) => fullCoords.slice(i0, i1 + 1));
 
-  return {
+  const base: RouteResult = {
     id,
-    distanceKm: trip.summary.length,
+    distanceKm: totalKm,
+    roadKm,
+    tollKm,
     drivingMin,
     geometry: thin(fullCoords),
     tollGeometry: tollGeometry.map(thin).filter((g) => g.length > 1),
     countries,
     tollBreakdown,
     tollTotalEur,
+    tollConfidence,
     specials,
     specialsTotalEur,
+    ferries: ferries.map((f) => ({ ...f, geometry: thin(f.geometry) })),
+    ferryTotalEur,
+    profile,
+    noGo,
     fuelLiters,
     fuelCostEur,
-    driverCostEur,
-    vehicleCostEur,
-    totalEur: tollTotalEur + fuelCostEur + driverCostEur + vehicleCostEur,
-    schedule: sched,
-    stops: Number.isFinite(depMs) ? stops : [],
-    warnings,
-    highways: !!trip.summary.has_highway,
-    ferry: !!trip.summary.has_ferry,
+    driverCostEur: 0,
+    vehicleCostEur: roadKm * c.vehicleKm,
+    totalEur: 0,
+    schedule: { drivingH: hAcc, breaks45: 0, dailyRests: 0, totalH: hAcc, days: 1, arrival: o.departure, waitH: 0, ferryH: 0 },
+    stops: [],
+    warnings: [],
+    highways: parts.some((p) => p.kind === "road" && !!p.trip.summary.has_highway),
+    ferry: ferries.length > 0,
     tollAccuracy: accuracy,
-    maneuvers: legs.flatMap((l) =>
-      l.maneuvers.map((m) => ({ text: m.instruction, km: m.length, min: m.time / 60, street: m.street_names?.[0] })),
-    ),
+    maneuvers,
   };
+  // alap menetrend (szünetek, pihenők, tilalmak, érkezés) – a kliens ugyanezzel számol újra
+  return applyPlan(base, autoPlan(base, o, v.weight), o, v.weight, c);
 }
 
-export async function planRoutes(req: RouteRequest): Promise<RouteResult[]> {
-  const { trips } = await routeRequest(req.waypoints, req.vehicle, req.options);
-  const results = await Promise.all(trips.map((t, i) => analyseTrip(t, req, i)));
-  // a leggyorsabb (kamionos menetidő-modell szerint) legyen az első
-  results.sort((a, b) => a.drivingMin - b.drivingMin);
-  return results.map((r, i) => ({ ...r, id: i }));
+export interface PlanResult { routes: RouteResult[]; exclude: Excl[] }
+
+export async function planRoutes(req: RouteRequest): Promise<PlanResult> {
+  const seg = splitByFerries(req.waypoints);
+  if (!seg.ferries.length) {
+    const set = await routeRequest(req.waypoints, req.vehicle, req.options);
+    const results = await Promise.all(set.trips.map((t, i) => analyse([{ kind: "road", trip: t }], req, i, set.unavoidable)));
+    // a leggyorsabb (kamionos menetidő-modell szerint) legyen az első
+    results.sort((a, b) => a.drivingMin - b.drivingMin);
+    return { routes: results.map((r, i) => ({ ...r, id: i })), exclude: set.exclude };
+  }
+  // komppal / vasúttal: a közúti szakaszok külön tervezve, a járat közéjük illesztve
+  const sets = await Promise.all(seg.roads.map((r) => routeRequest(r, req.vehicle, req.options, { alternates: false })));
+  const parts: Part[] = [];
+  let ri = 0;
+  let fi = 0;
+  for (const k of seg.order) {
+    if (k === "r") parts.push({ kind: "road", trip: sets[ri++].trips[0] });
+    else parts.push({ kind: "ferry", ...seg.ferries[fi++] });
+  }
+  const route = await analyse(parts, req, 0, [...new Set(sets.flatMap((s) => s.unavoidable))]);
+  return { routes: [route], exclude: sets.flatMap((s) => s.exclude).slice(0, 50) };
 }

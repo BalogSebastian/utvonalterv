@@ -32,8 +32,10 @@ export const VEHICLE_PRESETS: { id: string; name: string; v: Vehicle }[] = [
 ];
 
 export const DEFAULT_COSTS: CostInputs = {
-  fuelPrice: 1.55,
-  driverHourly: 22,
-  vehicleKm: 0.25,
-  eurHuf: 400,
+  fuelPrice: 1.45,
+  driverHourly: 18,
+  driverDaily: 45,
+  vehicleKm: 0.14,
+  vehicleDaily: 120,
+  eurHuf: 390,
 };

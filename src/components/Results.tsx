@@ -14,6 +14,8 @@ interface Props {
   onRemoveStop: (id: string) => void;
   onResetStops: () => void;
   edited: boolean;
+  onSnapParking: () => void;
+  parkStatus: string;
 }
 
 function download(name: string, text: string, type: string) {
@@ -33,19 +35,30 @@ function gpx(r: RouteResult) {
 function csv(r: RouteResult, c: CostInputs) {
   const rows = [
     ["Tétel", "EUR", "HUF"],
-    ["Útdíj", r.tollTotalEur, r.tollTotalEur * c.eurHuf],
+    ["Közúti km", r.roadKm.toFixed(1), ""],
+    ["Díjköteles km", r.tollKm.toFixed(1), ""],
+    ["Útdíj (nettó)", r.tollTotalEur, r.tollTotalEur * c.eurHuf],
+    ["Komp / vasút", r.ferryTotalEur, r.ferryTotalEur * c.eurHuf],
     ["Üzemanyag", r.fuelCostEur, r.fuelCostEur * c.eurHuf],
     ["Sofőr", r.driverCostEur, r.driverCostEur * c.eurHuf],
     ["Jármű (km-költség)", r.vehicleCostEur, r.vehicleCostEur * c.eurHuf],
     ["ÖSSZESEN", r.totalEur, r.totalEur * c.eurHuf],
     [],
     ["Ország", "Díjköteles km", "EUR/km", "Fix díj EUR", "Útdíj EUR"],
-    ...r.tollBreakdown.map((t) => [COUNTRY_NAMES[t.country] ?? t.country, t.tollKm.toFixed(1), t.perKm.toFixed(3), t.fixed, t.total.toFixed(2)]),
+    ...r.tollBreakdown.map((t) => [COUNTRY_NAMES[t.country] ?? t.country, t.tollKm.toFixed(1), t.perKm.toFixed(3), t.fixed.toFixed(2), t.total.toFixed(2)]),
+    ...r.specials.filter((x) => x.modelled).map((x) => [x.name, x.km.toFixed(1), "", "", x.fee.toFixed(2)]),
+    ...r.ferries.map((f) => [`${f.name} (${f.from} → ${f.to})`, f.km.toFixed(1), "", "", f.priceEur.toFixed(2)]),
+    [],
+    ["Megálló", "Idő", "Km", "Hely"],
+    ...r.stops.map((st) => [st.kind, st.time.replace("T", " "), st.km.toFixed(0), st.place ?? ""]),
+    ["Érkezés", r.schedule.arrival.replace("T", " "), r.distanceKm.toFixed(0), ""],
   ];
   return rows.map((row) => row.join(";")).join("\n");
 }
 
-export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited }: Props) {
+const KIND: Record<string, string> = { break: "☕ 45 perc szünet", rest: "🌙 Napi pihenő", wait: "⏳ Várakozás", ferry: "⛴ Komp / vasút" };
+
+export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited, onSnapParking, parkStatus }: Props) {
   const [showSteps, setShowSteps] = useState(false);
   const [margin, setMargin] = useState(15);
   const [roundTrip, setRoundTrip] = useState(false);
@@ -56,6 +69,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
 
   const parts = [
     { label: "Útdíj", v: r.tollTotalEur, color: "bg-amber-500" },
+    ...(r.ferryTotalEur > 0 ? [{ label: "Komp / vasút", v: r.ferryTotalEur, color: "bg-teal-500" }] : []),
     { label: "Üzemanyag", v: r.fuelCostEur, color: "bg-sky-500" },
     { label: "Sofőr", v: r.driverCostEur, color: "bg-violet-500" },
     { label: "Jármű", v: r.vehicleCostEur, color: "bg-emerald-500" },
@@ -80,12 +94,27 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
                 <span className="text-base font-bold">{eur(x.totalEur)}</span>
               </div>
               <div className="mt-0.5 text-xs text-slate-600 dark:text-slate-400">
-                {km(x.distanceKm)} · {dur(x.drivingMin)} vezetés · útdíj {eur(x.tollTotalEur)}
+                <b>{km(x.roadKm)}</b> · útdíj <b>{eur(x.tollTotalEur)}</b> · {dur(x.drivingMin)} vezetés · érkezés {dt(x.schedule.arrival)}
               </div>
             </button>
           ))}
         </div>
       )}
+
+      {r.noGo.length > 0 && (
+        <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+          {r.noGo.map((z) => (
+            <div key={z.name}>⛔ Az útvonal {km(z.km)}-t halad a(z) <b>{z.name}</b> No-Go zónában{z.unavoidable ? " – egy útpont a zónán belül van, vagy nincs kikerülő út." : " – nem sikerült teljesen elkerülni."}</div>
+          ))}
+        </div>
+      )}
+
+      <section className="grid grid-cols-2 gap-2">
+        <Fact k="Távolság (közúton)" v={km(r.roadKm)} sub={r.ferries.length ? `+ ${km(r.distanceKm - r.roadKm)} komp / vasút` : `ebből díjköteles ${km(r.tollKm)}`} />
+        <Fact k="Útdíj (nettó)" v={eur2(r.tollTotalEur)} sub={`${huf(r.tollTotalEur * costs.eurHuf)} · ${r.tollKm > 0 ? eur2(r.tollTotalEur / Math.max(r.tollKm, 1)) + "/díjas km" : ""}`} accent />
+        <Fact k="Várható érkezés" v={dt(r.schedule.arrival)} sub={r.schedule.arrivalLocal ? `helyi idő: ${dt(r.schedule.arrivalLocal)}` : `${r.schedule.totalH.toFixed(1)} óra az indulástól`} />
+        <Fact k="Útdíj-pontosság" v={`~${Math.min(99, Math.round(r.tollConfidence * 100))}%`} sub={r.tollConfidence >= 0.95 ? "hivatalos 2026-os tarifák" : "részben becsült tarifák"} good={r.tollConfidence >= 0.95} />
+      </section>
 
       <section className="rounded-2xl bg-gradient-to-br from-[#12306a] via-[#0f1f3d] to-[#0b1426] p-4 text-white shadow-lg shadow-blue-900/20 ring-1 ring-white/10">
         <div className="text-xs uppercase tracking-wide text-slate-400">Teljes fuvarköltség</div>
@@ -109,7 +138,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
             </div>
           ))}
         </dl>
-        <div className="mt-2 text-xs text-slate-400">Üzemanyag: {Math.round(r.fuelLiters)} liter</div>
+        <div className="mt-2 text-xs text-slate-400">Üzemanyag: {Math.round(r.fuelLiters)} liter · {r.schedule.days} naptári nap (napi költségek) · útdíj nettó, ÁFA nélkül</div>
       </section>
 
       <section className="card">
@@ -151,6 +180,22 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
         </section>
       )}
 
+      {r.ferries.length > 0 && (
+        <section className="space-y-2">
+          <h3 className="h3">Komp / vasút</h3>
+          {r.ferries.map((f) => (
+            <div key={f.id + f.f0} className={`rounded-lg border px-3 py-2 text-sm ${f.priced === "estimate" && !f.priceEur ? "border-red-300 bg-red-50 dark:border-red-800 dark:bg-red-950/40" : "border-teal-300 bg-teal-50 dark:border-teal-800 dark:bg-teal-950/30"}`}>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="font-medium">{f.kind === "rail" ? "🚆" : "⛴"} {f.name}</span>
+                <span className="font-bold tabular-nums">{f.priceEur ? eur2(f.priceEur) : "nincs ár"}</span>
+              </div>
+              <div className="text-xs text-slate-600 dark:text-slate-400">{f.from} → {f.to} · {dur(f.durationH * 60)} + {dur(f.checkInH * 60)} beszállás · {f.berth ? "fekhellyel (napi pihenőnek számíthat)" : "fekhely nélkül"} · {f.priced === "user" ? "saját ár" : f.priced === "catalog" ? "katalógusár" : "becslés"}</div>
+              <div className="mt-0.5 text-[11px] text-slate-500">{f.note}</div>
+            </div>
+          ))}
+        </section>
+      )}
+
       <section>
         <h3 className="h3">Útdíj országonként</h3>
         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
@@ -162,11 +207,11 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
               {r.tollBreakdown.map((t) => (
                 <tr key={t.country} className="border-t border-slate-100 align-top dark:border-slate-800" title={t.note}>
                   <td className="px-3 py-2">{flag(t.country)} {COUNTRY_NAMES[t.country] ?? t.country}
-                    {t.fixed > 0 && <div className="text-[11px] text-slate-500">időalapú díj</div>}
+                    {t.fixed > 0 && <div className="text-[11px] text-slate-500">időalapú díj: {eur2(t.fixed)} / nap</div>}
                     {t.roads.length > 0 && <div className="text-[11px] text-slate-500">{t.roads.join(", ")}</div>}
                     {t.confidence !== "none" && (
-                      <span className={`mt-0.5 inline-block rounded px-1.5 py-px text-[10px] font-semibold ${t.confidence === "source" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`} title={`${t.asOf}`}>
-                        {t.confidence === "source" ? "forrás szerint" : "becslés"}
+                      <span className={`mt-0.5 inline-block rounded px-1.5 py-px text-[10px] font-semibold ${t.confidence === "official" ? "bg-emerald-100 text-emerald-800" : t.confidence === "source" ? "bg-sky-100 text-sky-800" : "bg-amber-100 text-amber-800"}`} title={`${t.asOf}`}>
+                        {t.confidence === "official" ? "hivatalos tarifa" : t.confidence === "source" ? "forrás szerint" : "becslés"}
                       </span>
                     )}
                   </td>
@@ -186,7 +231,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
           <div className="mt-3 space-y-2">
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">Alagút- és szakaszdíjak</h4>
             {r.specials.map((sp) => (
-              <div key={sp.id} className={`rounded-lg border px-3 py-2 text-sm ${sp.modelled ? "border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30" : "border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/60"}`}>
+              <div key={sp.id} title={sp.asOf} className={`rounded-lg border px-3 py-2 text-sm ${sp.modelled ? "border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30" : "border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/60"}`}>
                 <div className="flex items-baseline justify-between gap-2">
                   <span className="font-medium">🚇 {sp.name}</span>
                   <span className="font-bold tabular-nums">{sp.modelled ? eur2(sp.fee) : "nincs bekalkulálva"}</span>
@@ -197,7 +242,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
           </div>
         )}
         <p className="mt-1.5 text-xs text-slate-500">
-          <b>Forrás szerint</b>: 2026-os, nyilvános (másodlagos) forrásból ellenőrzött tarifa; <b>becslés</b>: nincs megbízható forrás. Egérrel a sorra állva a részletek láthatók. A tarifák a <code>src/lib/tolls.ts</code> fájlban frissíthetők. A felismert alagút-/szakaszdíjak külön szerepelnek (az útdíj összegben benne vannak).
+          <b>Hivatalos tarifa</b>: a 2026-os hivatalos díjtáblából; <b>forrás szerint</b>: hivatalos díjpéldákból számolt átlag (kapus rendszerek); <b>becslés</b>: nincs megbízható forrás. Minden összeg nettó (ÁFA nélkül). Egérrel a sorra állva a részletek láthatók. A felismert alagút-/híd-/szakaszdíjak külön szerepelnek (az útdíj összegben benne vannak).
           {r.tollAccuracy === "maneuver" && " ⚠ Ennél az útnál a díjköteles szakaszok pontossága csökkent (a részletes úthálózati adat nem volt elérhető)."}
         </p>
       </section>
@@ -208,33 +253,41 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
           <Stat k="Vezetési idő" v={dur(r.schedule.drivingH * 60)} />
           <Stat k="Összes idő pihenőkkel" v={`${r.schedule.totalH.toFixed(1)} óra`} />
           <Stat k="45 perces szünetek" v={`${r.schedule.breaks45} db`} />
-          <Stat k="Napi pihenők (11 óra)" v={`${r.schedule.dailyRests} db`} />
-          <Stat k="Várható érkezés" v={dt(r.schedule.arrival)} wide />
+          <Stat k="Napi pihenők" v={`${r.schedule.dailyRests} db`} />
+          {r.schedule.waitH > 0 && <Stat k="Tilalom miatti várakozás" v={dur(r.schedule.waitH * 60)} />}
+          {r.schedule.ferryH > 0 && <Stat k="Komp / vasút (beszállással)" v={dur(r.schedule.ferryH * 60)} />}
+          <Stat k="Várható érkezés" v={`${dt(r.schedule.arrival)}${r.schedule.arrivalLocal ? ` (helyi: ${dt(r.schedule.arrivalLocal)})` : ""}`} wide />
         </div>
       </section>
 
       <section>
         <h3 className="h3">Szünetek és pihenők</h3>
-        <p className="mb-2 text-xs text-slate-500">Húzd a ☕ / 🌙 jelölőket a térképen: az útvonal mentén csúsztatva csak a menetrend számolódik újra; ha egy másik városba engeded el, ott köztes pont lesz, és az útvonal is újraszámolódik rajta át.</p>
+        <p className="mb-2 text-xs text-slate-500">Az automatikus terv a legkorábbi jogszerű érkezést adja (4,5 óránként 45 perc, napi 9 – hetente 2× 10 – óra vezetés, 11 – hetente 3× 9 – órás pihenő, a tilalmak kivárásával). Húzd a ☕ / 🌙 jelölőket a térképen: az útvonal mentén csúsztatva csak a menetrend számolódik újra; ha egy másik városba engeded el, ott köztes pont lesz, és az útvonal is újraszámolódik rajta át.</p>
         <ul className="space-y-1 text-sm">
           {r.stops.map((st) => (
-            <li key={st.id} className={`rounded-lg px-3 py-1.5 ${st.warn ? "bg-red-50 dark:bg-red-950/40" : "bg-slate-50 dark:bg-slate-800/60"}`}>
+            <li key={st.id} className={`rounded-lg px-3 py-1.5 ${st.warn ? "bg-red-50 dark:bg-red-950/40" : st.kind === "wait" ? "bg-amber-50 dark:bg-amber-950/30" : st.kind === "ferry" ? "bg-teal-50 dark:bg-teal-950/30" : "bg-slate-50 dark:bg-slate-800/60"}`}>
               <div className="flex items-center justify-between gap-2">
-                <span>{st.kind === "rest" ? "🌙 Napi pihenő" : "☕ 45 perc szünet"}{st.anchored ? " 📍" : ""} · {st.day}. nap · {flag(st.country)} ~{Math.round(st.km)}. km</span>
+                <span>{KIND[st.kind]}{st.kind !== "break" && st.durH ? ` (${dur(st.durH * 60)})` : ""}{st.anchored ? " 📍" : ""} · {st.day}. nap · {flag(st.country)} ~{Math.round(st.km)}. km</span>
                 <span className="flex items-center gap-2">
                   <span className="text-xs text-slate-500">{dt(st.time)}</span>
-                  <button className="text-slate-400 hover:text-red-600" title="Törlés" onClick={() => onRemoveStop(st.id)}>✕</button>
+                  {(st.kind === "break" || st.kind === "rest") && <button className="text-slate-400 hover:text-red-600" title="Törlés" onClick={() => onRemoveStop(st.id)}>✕</button>}
                 </span>
               </div>
+              {st.place && <div className="mt-0.5 text-xs text-slate-600 dark:text-slate-400">{st.place}</div>}
               {st.warn && <div className="mt-0.5 text-xs text-red-700 dark:text-red-300">⚠ {st.warn}</div>}
             </li>
           ))}
+          <li className="flex items-center justify-between rounded-lg bg-emerald-50 px-3 py-1.5 font-medium dark:bg-emerald-950/30">
+            <span>🏁 Érkezés · {km(r.distanceKm)}</span><span className="text-xs">{dt(r.schedule.arrival)}</span>
+          </li>
         </ul>
         <div className="mt-2 flex flex-wrap gap-2">
           <button className="btn" onClick={() => onAddStop("break")}>+ ☕ Szünet</button>
           <button className="btn" onClick={() => onAddStop("rest")}>+ 🌙 Pihenő</button>
+          <button className="btn" onClick={onSnapParking} title="A szüneteket és pihenőket a határidő előtti legközelebbi valós kamionparkolóhoz / pihenőhöz illeszti">🅿 Valós kamionparkolókhoz illesztés</button>
           {edited && <button className="btn" onClick={onResetStops}>↺ Alaphelyzet</button>}
         </div>
+        {parkStatus && <p className="mt-1.5 text-xs text-slate-500">{parkStatus}</p>}
       </section>
 
       <section>
@@ -242,7 +295,7 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
         <ul className="space-y-1 text-sm">
           {r.countries.map((c, i) => (
             <li key={i} className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-1.5 dark:bg-slate-800/60">
-              <span>{flag(c.country)} {COUNTRY_NAMES[c.country] ?? c.country} · {km(c.km)}</span>
+              <span>{flag(c.country)} {COUNTRY_NAMES[c.country] ?? c.country} · {km(c.km)}{c.tollKm > 0 ? <span className="text-xs text-slate-500"> (díjas {km(c.tollKm)})</span> : null}</span>
               <span className="text-xs text-slate-500">{dt(c.enter)} → {dt(c.leave)}</span>
             </li>
           ))}
@@ -266,6 +319,16 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
           ))}
         </ol>
       )}
+    </div>
+  );
+}
+
+function Fact({ k, v, sub, accent, good }: { k: string; v: string; sub?: string; accent?: boolean; good?: boolean }) {
+  return (
+    <div className={`rounded-2xl border p-3 shadow-sm ${accent ? "border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30" : "border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900"}`}>
+      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">{k}</div>
+      <div className={`mt-0.5 text-lg font-bold tabular-nums leading-tight ${good === false ? "text-amber-600" : good ? "text-emerald-600" : ""}`}>{v}</div>
+      {sub && <div className="mt-0.5 text-[11px] leading-tight text-slate-500">{sub}</div>}
     </div>
   );
 }

@@ -52,6 +52,15 @@ function inRing(x: number, y: number, ring: number[][]): boolean {
   return inside;
 }
 
+/** Egy ország poligonjai ([outer, ...holes][]), vagy null. */
+export function countryPolygons(a2: string): number[][][][] | null {
+  if (!cache) cache = build();
+  const c = cache.find((x) => x.a2 === a2);
+  return c ? c.polys : null;
+}
+
+export const KNOWN_COUNTRIES = Object.values(NUM_TO_A2);
+
 /** Országkód (alpha2) egy pontra; null ha tenger / ismeretlen. */
 export function countryAt([x, y]: LngLat): string | null {
   if (!cache) cache = build();

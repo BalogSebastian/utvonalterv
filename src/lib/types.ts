@@ -6,6 +6,8 @@ export interface Waypoint {
   label: string;
   /** az útvonal húzásával létrejött áthaladási pont (nem megálló) */
   via?: boolean;
+  /** komp / vasúti járat (a katalógus azonosítója); lat/lon ilyenkor a járat közepe */
+  ferry?: string;
 }
 
 export type EuroClass = "euro6" | "euro5" | "euro4" | "older";
@@ -27,9 +29,33 @@ export interface Vehicle {
 
 export interface CostInputs {
   fuelPrice: number; // EUR / liter
-  driverHourly: number; // EUR / óra (teljes költség)
-  vehicleKm: number; // EUR / km (kopás, szerviz, amortizáció)
+  driverHourly: number; // EUR / óra (teljes munkáltatói költség)
+  /** EUR / nap: napidíj, szállás */
+  driverDaily: number;
+  vehicleKm: number; // EUR / km (gumi, szerviz, kopás)
+  /** EUR / nap: amortizáció / lízing, biztosítás, gépjárműadó */
+  vehicleDaily: number;
   eurHuf: number; // HUF / EUR
+}
+
+/** No-Go zóna: egész ország vagy saját rajzolt terület */
+export interface NoGoArea {
+  id: string;
+  name: string;
+  /** zárt gyűrű [lng,lat][] */
+  ring: LngLat[];
+}
+
+export interface NoGo {
+  /** ISO alpha-2 országkódok */
+  countries: string[];
+  areas: NoGoArea[];
+}
+
+/** a felhasználó saját (pl. szerződéses) komp-ára / menetideje */
+export interface FerryOverride {
+  priceEur?: number;
+  durationH?: number;
 }
 
 export interface RouteOptions {
@@ -37,6 +63,14 @@ export interface RouteOptions {
   avoidHighways: boolean;
   /** indulási idő ISO (helyi, tz nélkül) */
   departure: string;
+  noGo?: NoGo;
+  ferryOverrides?: Record<string, FerryOverride>;
+  /** EU 561/2006 rugalmasság: heti 2× 10 órás vezetés, 3× 9 órás csökkentett pihenő */
+  flexRules?: boolean;
+  /** a hétvégi / ünnepnapi tilalmak kivárása beépül az érkezési időbe */
+  waitBans?: boolean;
+  /** a már ismert kizárt pontok (No-Go zóna) – a húzás közbeni előnézethez */
+  exclude?: { lat: number; lon: number }[];
 }
 
 export interface RouteRequest {
@@ -79,7 +113,7 @@ export interface TollBreakdownItem {
   total: number;
   note: string;
   roads: string[];
-  confidence: "source" | "estimate" | "none";
+  confidence: "official" | "source" | "estimate" | "none";
   asOf: string;
 }
 
@@ -92,18 +126,22 @@ export interface SpecialItem {
   fee: number;
   modelled: boolean;
   note: string;
-  confidence: "source" | "estimate";
+  confidence: "official" | "source" | "estimate";
   asOf: string;
 }
 
 export interface TripStop {
   id: string;
+  /** valós kamionparkoló neve, ha oda illesztettük */
+  place?: string;
   anchored?: boolean;
   /** a menetrend-szabály megsértése ennél a megállónál */
   warn?: string;
   /** az útvonal mentén megtett arány 0..1 */
   f: number;
-  kind: "break" | "rest";
+  kind: "break" | "rest" | "wait" | "ferry";
+  /** a megálló hossza (óra) */
+  durH?: number;
   /** vezetés kezdete óta, óra */
   atH: number;
   /** út menti km */
@@ -123,6 +161,35 @@ export interface DriveSchedule {
   totalH: number;
   days: number;
   arrival: string;
+  /** a célország helyi ideje szerinti érkezés (ha eltér) */
+  arrivalLocal?: string;
+  /** tilalom miatti várakozás (óra) */
+  waitH: number;
+  /** komp / vasút (óra, beszállással) */
+  ferryH: number;
+}
+
+/** útvonal-arány (0..1) → addig megtett vezetési idő (óra), szakaszonként lineáris */
+export type TimeProfile = [number, number][];
+
+export interface FerryLeg {
+  id: string;
+  name: string;
+  kind: "ferry" | "rail";
+  from: string;
+  to: string;
+  f0: number;
+  f1: number;
+  km: number;
+  durationH: number;
+  checkInH: number;
+  priceEur: number;
+  /** van-e kabin / fekhely (a hajóút napi pihenőnek számíthat, 561/2006 9. cikk) */
+  berth: boolean;
+  /** a katalógusból / a felhasználó áraiból jött, vagy csak becsült */
+  priced: "catalog" | "user" | "estimate";
+  note: string;
+  geometry: LngLat[];
 }
 
 export interface RouteResult {
@@ -136,6 +203,15 @@ export interface RouteResult {
   countries: CountryLeg[];
   tollBreakdown: TollBreakdownItem[];
   tollTotalEur: number;
+  /** km közúton (komp nélkül) */
+  roadKm: number;
+  /** a teljes távolság díjköteles km-ei */
+  tollKm: number;
+  ferries: FerryLeg[];
+  ferryTotalEur: number;
+  profile: TimeProfile;
+  /** a No-Go zónák figyelmeztetései / érintett km */
+  noGo: { name: string; km: number; unavoidable: boolean }[];
   /** alagút-/szakaszdíjak (benne vannak a tollTotalEur-ban, ha modelled) */
   specials: SpecialItem[];
   specialsTotalEur: number;
@@ -144,6 +220,8 @@ export interface RouteResult {
   driverCostEur: number;
   vehicleCostEur: number;
   totalEur: number;
+  /** tájékoztató: az útdíj-számítás becsült pontossága (0..1) a tarifák megbízhatósága alapján */
+  tollConfidence: number;
   schedule: DriveSchedule;
   stops: TripStop[];
   warnings: BanWarning[];
@@ -156,4 +234,6 @@ export interface RouteResult {
 export interface RouteResponse {
   routes: RouteResult[];
   source: string;
+  /** a No-Go zónák elkerüléséhez használt kizárt pontok (az előnézethez újrahasznosítható) */
+  exclude: { lat: number; lon: number }[];
 }
