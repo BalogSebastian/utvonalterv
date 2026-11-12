@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { Waypoint } from "@/lib/types";
+import type { CargoKind, Waypoint } from "@/lib/types";
 import { Ico } from "./ui";
 
 interface Result { label: string; lat: number; lon: number }
@@ -15,9 +15,19 @@ interface Props {
   onChange: (w: Waypoint | null) => void;
   onPickToggle: () => void;
   onRemove?: () => void;
+  /** rakodás ezen a ponton (csak megállóknál) */
+  cargo?: CargoKind;
+  onCargo?: (k: CargoKind) => void;
 }
 
-export default function WaypointInput({ badge, badgeClass, placeholder, value, picking, onChange, onPickToggle, onRemove }: Props) {
+const CARGO_OPTS: [CargoKind, string, string][] = [
+  ["load", "⬆ Fel", "Felrakás"],
+  ["unload", "⬇ Le", "Lerakás"],
+  ["both", "⇅ Fel+le", "Felrakás és lerakás"],
+  ["none", "– Nincs", "Nincs rakodás (pl. parkoló, telephely)"],
+];
+
+export default function WaypointInput({ badge, badgeClass, placeholder, value, picking, onChange, onPickToggle, onRemove, cargo, onCargo }: Props) {
   const [text, setText] = useState(value?.label ?? "");
   const [results, setResults] = useState<Result[]>([]);
   const [open, setOpen] = useState(false);
@@ -80,6 +90,16 @@ export default function WaypointInput({ badge, badgeClass, placeholder, value, p
           </ul>
         )}
       </div>
+      {cargo && onCargo && (
+        <select
+          value={cargo}
+          onChange={(e) => onCargo(e.target.value as CargoKind)}
+          title={`Rakodás ezen a ponton: ${CARGO_OPTS.find((o) => o[0] === cargo)?.[2]} (a feltételes határátkelőkhöz)`}
+          className="field h-[34px] w-[74px] shrink-0 !px-1.5 !py-0 !text-[11px]"
+        >
+          {CARGO_OPTS.map(([k, short, long]) => <option key={k} value={k} title={long}>{short}</option>)}
+        </select>
+      )}
       <button
         type="button"
         title="Pont kijelölése a térképen"

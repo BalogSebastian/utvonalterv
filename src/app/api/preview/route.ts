@@ -1,6 +1,7 @@
 import { decodePolyline } from "@/lib/polyline";
 import { ferryPath, splitByFerries } from "@/lib/ferries";
 import { routeRequest, ValhallaError } from "@/lib/valhalla";
+import { blockedCrossings } from "@/lib/planner";
 import type { LngLat, RouteRequest } from "@/lib/types";
 
 /** Gyors útvonal-előnézet az útvonal húzása közben (csak geometria, útdíjszámítás nélkül). */
@@ -20,7 +21,8 @@ export async function POST(req: Request) {
     const seg = splitByFerries(body.waypoints);
     // az előnézet a már ismert kizárásokat használja, új No-Go iteráció nélkül
     const o = { ...body.options, noGo: undefined };
-    const sets = await Promise.all(seg.roads.map((r) => routeRequest(r, body.vehicle, o, { alternates: false, light: true })));
+    const blocked = await blockedCrossings(body);
+    const sets = await Promise.all(seg.roads.map((r) => routeRequest(r, body.vehicle, o, { alternates: false, light: true, blocked })));
     const out: LngLat[] = [];
     let ri = 0;
     let fi = 0;

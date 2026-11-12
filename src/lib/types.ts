@@ -8,6 +8,35 @@ export interface Waypoint {
   via?: boolean;
   /** komp / vasúti járat (a katalógus azonosítója); lat/lon ilyenkor a járat közepe */
   ferry?: string;
+  /**
+   * rakodás ezen a ponton (a feltételes határátkelőkhöz). Ha nincs megadva:
+   * az indulás felrakás, az érkezés lerakás, a köztes megálló mindkettő.
+   */
+  cargo?: CargoKind;
+}
+
+export type CargoKind = "load" | "unload" | "both" | "none";
+
+/**
+ * Feltételes határátkelő: csak akkor használható, ha a fuvarnak van felrakása / lerakása
+ * a megadott ország(ok) valamelyikében – különben az útvonal elkerüli.
+ */
+export interface BorderCrossing {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  /** az átkelő két oldala (ISO alpha-2) */
+  countries: string[];
+  /** ezen országok valamelyikében kell rakodni, hogy az átkelő használható legyen */
+  requireIn: string[];
+  /** any: felrakás vagy lerakás · load: csak felrakás · unload: csak lerakás */
+  mode: "any" | "load" | "unload";
+  /** a lezárt terület sugara (m), alapértelmezés 80 */
+  radiusM?: number;
+  note?: string;
+  /** kikapcsolt szabály (nem érvényes) */
+  disabled?: boolean;
 }
 
 export type EuroClass = "euro6" | "euro5" | "euro4" | "older";
@@ -69,6 +98,10 @@ export interface RouteOptions {
   flexRules?: boolean;
   /** a hétvégi / ünnepnapi tilalmak kivárása beépül az érkezési időbe */
   waitBans?: boolean;
+  /** a felhasználó feltételes határátkelői */
+  crossings?: BorderCrossing[];
+  /** a beépített katalógus kikapcsolt átkelői (azonosítók) */
+  crossingsOff?: string[];
   /** a már ismert kizárt pontok (No-Go zóna) – a húzás közbeni előnézethez */
   exclude?: { lat: number; lon: number }[];
 }
@@ -210,6 +243,8 @@ export interface RouteResult {
   ferries: FerryLeg[];
   ferryTotalEur: number;
   profile: TimeProfile;
+  /** a feltételes határátkelők az útvonal mentén (használt vagy elkerült) */
+  crossings: CrossingUse[];
   /** a No-Go zónák figyelmeztetései / érintett km */
   noGo: { name: string; km: number; unavoidable: boolean }[];
   /** alagút-/szakaszdíjak (benne vannak a tollTotalEur-ban, ha modelled) */
@@ -229,6 +264,19 @@ export interface RouteResult {
   ferry: boolean;
   tollAccuracy: "edge" | "maneuver";
   maneuvers: { text: string; km: number; min: number; street?: string }[];
+}
+
+export interface CrossingUse {
+  id: string;
+  name: string;
+  countries: string[];
+  /** a fuvar alapján használható-e */
+  allowed: boolean;
+  /** az útvonal áthalad rajta */
+  used: boolean;
+  /** távolság az útvonaltól (km) */
+  distKm: number;
+  reason: string;
 }
 
 export interface RouteResponse {

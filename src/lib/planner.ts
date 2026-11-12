@@ -4,13 +4,15 @@ import { TOLL_RULES, fixedFee, isTolledEdge, ratePerKm } from "./tolls";
 import { SPECIALS, specialFee } from "./specials";
 import { ferryPath, ferryPrice, matchFerry, pathKm, splitByFerries, type FerryLine } from "./ferries";
 import { buildZones, inZone } from "./zones";
+import { activeCrossings, crossingAllowed, nearestOnLine, passesKm } from "./crossings";
+import { waypointCountries } from "./wpcountry";
 import { applyPlan, autoPlan } from "./schedule";
 import { DEFAULT_COSTS } from "./presets";
 import {
   routeRequest, traceEdges, type Excl, type VLeg, type VTrip,
 } from "./valhalla";
 import type {
-  CountryLeg, FerryLeg, LngLat, RouteRequest, RouteResult, TimeProfile, TollBreakdownItem, SpecialItem,
+  BorderCrossing, CountryLeg, CrossingUse, FerryLeg, LngLat, RouteRequest, RouteResult, TimeProfile, TollBreakdownItem, SpecialItem,
 } from "./types";
 
 interface EdgeLike {
@@ -133,7 +135,9 @@ type Part = { kind: "road"; trip: VTrip } | { kind: "ferry"; line: FerryLine; re
 
 const CONF_WEIGHT = { official: 0.99, source: 0.95, estimate: 0.8, none: 0.7 } as const;
 
-async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable: string[]): Promise<RouteResult> {
+interface CrossCtx { all: BorderCrossing[]; status: Map<string, { allowed: boolean; reason: string }> }
+
+async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable: string[], cx: CrossCtx): Promise<RouteResult> {
   const { vehicle: v, costs: c0, options: o } = req;
   const c = { ...DEFAULT_COSTS, ...c0 };
   const depMs = Date.parse(`${o.departure}:00Z`);
@@ -365,6 +369,23 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
     .map((z) => ({ name: z.name, km: zoneKm.get(z.id) ?? 0, unavoidable: unavoidable.includes(z.name) }))
     .filter((z) => z.km > 0.5);
 
+  // --- feltételes határátkelők az útvonal mentén ---
+  const crossings: CrossingUse[] = [];
+  for (const cr of cx.all) {
+    const st = cx.status.get(cr.id);
+    if (!st) continue;
+    const n = nearestOnLine(fullCoords, [cr.lon, cr.lat]);
+    if (n.km > 40) continue;
+    const used = n.km <= passesKm(cr);
+    crossings.push({
+      id: cr.id, name: cr.name, countries: cr.countries, allowed: st.allowed, used, distKm: n.km,
+      reason: used && !st.allowed
+        ? `${st.reason.replace(/, ezért elkerüljük\.$/, ".")} Nem sikerült elkerülni – nincs más engedélyezett út, vagy egy útpont az átkelőnél van.`
+        : st.reason,
+    });
+  }
+  crossings.sort((a, b) => Number(b.used && !b.allowed) - Number(a.used && !a.allowed) || Number(b.used) - Number(a.used) || a.distKm - b.distKm);
+
   // --- közvetlen költségek (a sofőr és a napi költség a menetrendből jön: applyPlan) ---
   const fuelLiters = (roadKm * v.consumption) / 100;
   const fuelCostEur = fuelLiters * c.fuelPrice;
@@ -388,6 +409,7 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
     ferryTotalEur,
     profile,
     noGo,
+    crossings,
     fuelLiters,
     fuelCostEur,
     driverCostEur: 0,
@@ -407,17 +429,35 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
 
 export interface PlanResult { routes: RouteResult[]; exclude: Excl[] }
 
+/** a fuvar pontjai alapján: mely feltételes átkelők használhatók, melyek zárulnak le */
+async function crossingContext(req: RouteRequest): Promise<CrossCtx> {
+  const all = activeCrossings(req.options.crossings, req.options.crossingsOff);
+  const status = new Map<string, { allowed: boolean; reason: string }>();
+  if (all.length) {
+    const wpCc = await waypointCountries(req.waypoints);
+    for (const c of all) status.set(c.id, crossingAllowed(c, req.waypoints, wpCc));
+  }
+  return { all, status };
+}
+
+export async function blockedCrossings(req: Pick<RouteRequest, "waypoints" | "options">): Promise<BorderCrossing[]> {
+  const cx = await crossingContext(req as RouteRequest);
+  return cx.all.filter((c) => cx.status.get(c.id)?.allowed === false);
+}
+
 export async function planRoutes(req: RouteRequest): Promise<PlanResult> {
+  const cx = await crossingContext(req);
+  const blocked = cx.all.filter((c) => cx.status.get(c.id)?.allowed === false);
   const seg = splitByFerries(req.waypoints);
   if (!seg.ferries.length) {
-    const set = await routeRequest(req.waypoints, req.vehicle, req.options);
-    const results = await Promise.all(set.trips.map((t, i) => analyse([{ kind: "road", trip: t }], req, i, set.unavoidable)));
+    const set = await routeRequest(req.waypoints, req.vehicle, req.options, { blocked });
+    const results = await Promise.all(set.trips.map((t, i) => analyse([{ kind: "road", trip: t }], req, i, set.unavoidable, cx)));
     // a leggyorsabb (kamionos menetidő-modell szerint) legyen az első
     results.sort((a, b) => a.drivingMin - b.drivingMin);
     return { routes: results.map((r, i) => ({ ...r, id: i })), exclude: set.exclude };
   }
   // komppal / vasúttal: a közúti szakaszok külön tervezve, a járat közéjük illesztve
-  const sets = await Promise.all(seg.roads.map((r) => routeRequest(r, req.vehicle, req.options, { alternates: false })));
+  const sets = await Promise.all(seg.roads.map((r) => routeRequest(r, req.vehicle, req.options, { alternates: false, blocked })));
   const parts: Part[] = [];
   let ri = 0;
   let fi = 0;
@@ -425,6 +465,6 @@ export async function planRoutes(req: RouteRequest): Promise<PlanResult> {
     if (k === "r") parts.push({ kind: "road", trip: sets[ri++].trips[0] });
     else parts.push({ kind: "ferry", ...seg.ferries[fi++] });
   }
-  const route = await analyse(parts, req, 0, [...new Set(sets.flatMap((s) => s.unavoidable))]);
+  const route = await analyse(parts, req, 0, [...new Set(sets.flatMap((s) => s.unavoidable))], cx);
   return { routes: [route], exclude: sets.flatMap((s) => s.exclude).slice(0, 50) };
 }

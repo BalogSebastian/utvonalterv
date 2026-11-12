@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { COUNTRY_NAMES } from "@/lib/country-names";
 import { dt, dur, eur, eur2, flag, huf, km } from "@/lib/format";
-import type { CostInputs, RouteResult } from "@/lib/types";
+import type { CostInputs, RouteResult, Waypoint } from "@/lib/types";
+import DriverSend from "./DriverSend";
 
 interface Props {
   routes: RouteResult[];
@@ -16,6 +17,8 @@ interface Props {
   edited: boolean;
   onSnapParking: () => void;
   parkStatus: string;
+  waypoints: Waypoint[];
+  departure: string;
 }
 
 function download(name: string, text: string, type: string) {
@@ -58,7 +61,7 @@ function csv(r: RouteResult, c: CostInputs) {
 
 const KIND: Record<string, string> = { break: "☕ 45 perc szünet", rest: "🌙 Napi pihenő", wait: "⏳ Várakozás", ferry: "⛴ Komp / vasút" };
 
-export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited, onSnapParking, parkStatus }: Props) {
+export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited, onSnapParking, parkStatus, waypoints, departure }: Props) {
   const [showSteps, setShowSteps] = useState(false);
   const [margin, setMargin] = useState(15);
   const [roundTrip, setRoundTrip] = useState(false);
@@ -105,6 +108,14 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
         <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
           {r.noGo.map((z) => (
             <div key={z.name}>⛔ Az útvonal {km(z.km)}-t halad a(z) <b>{z.name}</b> No-Go zónában{z.unavoidable ? " – egy útpont a zónán belül van, vagy nincs kikerülő út." : " – nem sikerült teljesen elkerülni."}</div>
+          ))}
+        </div>
+      )}
+
+      {r.crossings.some((c) => c.used && !c.allowed) && (
+        <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+          {r.crossings.filter((c) => c.used && !c.allowed).map((c) => (
+            <div key={c.id}>🛂 Az útvonal a(z) <b>{c.name}</b> átkelőn halad át. {c.reason}</div>
           ))}
         </div>
       )}
@@ -301,6 +312,25 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
           ))}
         </ul>
       </section>
+
+      {r.crossings.length > 0 && (
+        <section>
+          <h3 className="h3">Feltételes határátkelők az útvonal mentén</h3>
+          <ul className="space-y-1 text-sm">
+            {r.crossings.map((c) => (
+              <li key={c.id} className={`rounded-lg px-3 py-1.5 ${c.used && !c.allowed ? "bg-red-50 dark:bg-red-950/40" : c.used ? "bg-emerald-50 dark:bg-emerald-950/30" : "bg-slate-50 dark:bg-slate-800/60"}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <span>{c.used ? (c.allowed ? "✅" : "⛔") : c.allowed ? "➖" : "↪"} <b>{c.name}</b> {c.countries.map(flag).join("–")}</span>
+                  <span className="shrink-0 text-xs text-slate-500">{c.used ? "használja" : c.allowed ? `nem érinti (${km(c.distKm)})` : `elkerülve (${km(c.distKm)})`}</span>
+                </div>
+                <div className="text-xs text-slate-500">{c.reason}</div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <DriverSend route={r} waypoints={waypoints} departure={departure} />
 
       <section className="flex flex-wrap gap-2">
         <button className="btn" onClick={() => download("kamion-utvonal.gpx", gpx(r), "application/gpx+xml")}>GPX letöltés</button>

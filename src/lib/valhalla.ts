@@ -1,6 +1,8 @@
-import { decodePolyline } from "./polyline";
-import { buildZones, exclusionPoints, intrusions, perimeterKm, unavoidableZones, type Zone } from "./zones";
-import type { LngLat, RouteOptions, Vehicle, Waypoint } from "./types";
+import { decodePolyline, encodePolyline } from "./polyline";
+import { buildZones, deepRun, exclusionPoints, hav, intrusions, perimeterKm, unavoidableZones, type Intrusion, type Zone } from "./zones";
+import { crossingSquare, nearestOnLine, passesKm } from "./crossings";
+import { waypointCountries } from "./wpcountry";
+import type { BorderCrossing, LngLat, RouteOptions, Vehicle, Waypoint } from "./types";
 
 /** Valhalla szerver(ek): VALHALLA_URLS=vesszővel elválasztott lista (failover), vagy VALHALLA_URL */
 const HOSTS = (process.env.VALHALLA_URLS ?? process.env.VALHALLA_URL ?? "https://valhalla1.openstreetmap.de")
@@ -292,10 +294,25 @@ const similar = (a: VTrip, b: VTrip) =>
 
 const tripCoords = (t: VTrip): LngLat[] => t.legs.flatMap((l, i) => (i ? decodePolyline(l.shape).slice(1) : decodePolyline(l.shape)));
 
-/** natívan kizárható saját zónák (a kerület-limitig) */
-function nativePolygons(zones: Zone[], skip: Set<string>): LngLat[][] {
+/**
+ * Natív kizáró poligonok a szerver kerület-limitjéig: először a lezárt határátkelők
+ * (kis négyzetek, a útpontok közötti folyosóhoz legközelebbiek elöl), utána a kis saját zónák.
+ */
+function nativePolygons(zones: Zone[], skip: Set<string>, blocked: BorderCrossing[], waypoints: Waypoint[]): LngLat[][] {
   const out: LngLat[][] = [];
   let budget = MAX_EXCLUDE_KM * 0.95;
+  const line: LngLat[] = waypoints.map((w) => [w.lon, w.lat]);
+  const ranked = blocked
+    .map((c) => ({ c, d: line.length > 1 ? nearestOnLine(line, [c.lon, c.lat]).km : 0 }))
+    .filter((x) => x.d < 250)
+    .sort((a, b) => a.d - b.d);
+  for (const { c } of ranked) {
+    const sq = crossingSquare(c);
+    const per = perimeterKm(sq);
+    if (per > budget) break;
+    budget -= per;
+    out.push(sq);
+  }
   for (const z of zones) {
     if (skip.has(z.id)) continue;
     for (const poly of z.polys) {
@@ -309,65 +326,156 @@ function nativePolygons(zones: Zone[], skip: Set<string>): LngLat[][] {
   return out;
 }
 
+/**
+ * A durva (1:50m) határral talált rövid ország-behatolásokat a routing-szerver pontos
+ * közigazgatási adataival ellenőrizzük: a határ menti „álbehatolás” kiesik, a valódi
+ * szakasz pontos kezdete / vége marad.
+ */
+async function preciseRuns(coords: LngLat[], runs: Intrusion[], v: Vehicle, o: RouteOptions): Promise<Intrusion[]> {
+  const out: Intrusion[] = [];
+  for (const r of runs) {
+    if (!r.zone.country || r.km >= 40) { out.push(r); continue; }
+    const a = Math.max(0, r.a - 3);
+    const b = Math.min(coords.length - 1, r.b + 3);
+    try {
+      const t = await post<{ shape: string; edges?: { length: number; begin_shape_index: number; end_shape_index: number; end_node?: { admin_index?: number } }[]; admins?: { country_code?: string }[] }>(
+        "/trace_attributes",
+        {
+          encoded_polyline: encodePolyline(coords.slice(a, b + 1)),
+          costing: "truck",
+          costing_options: truckCosting(v, o),
+          shape_match: "edge_walk",
+          filters: { attributes: ["shape", "edge.length", "edge.begin_shape_index", "edge.end_shape_index", "node.admin_index", "admin.country_code"], action: "include" },
+        },
+        30000,
+      );
+      const sh = decodePolyline(t.shape);
+      let km = 0;
+      let first: LngLat | null = null;
+      let last: LngLat | null = null;
+      for (const e of t.edges ?? []) {
+        const cc = e.end_node?.admin_index !== undefined ? t.admins?.[e.end_node.admin_index]?.country_code : undefined;
+        if (cc !== r.zone.country) continue;
+        km += e.length;
+        first ??= sh[e.begin_shape_index];
+        last = sh[e.end_shape_index];
+      }
+      if (km < 0.3 || !first || !last) continue;
+      const near = (p: LngLat) => {
+        let bi = a, bd = Infinity;
+        for (let i = a; i <= b; i++) { const d = hav(coords[i], p); if (d < bd) { bd = d; bi = i; } }
+        return bi;
+      };
+      const ia = near(first);
+      const ib = Math.max(ia, near(last));
+      out.push({ zone: r.zone, a: ia, b: ib, km });
+    } catch {
+      // ellenőrzés nélkül: a durva határ szerinti szakasz
+      if (deepRun(coords, r.zone, r.a, r.b)) out.push(r);
+    }
+  }
+  return out;
+}
+
+/** a lezárt átkelőkön áthaladó pontok: a kizáráshoz az útvonal saját pontjai (a használt pályatest) */
+function crossingHits(coords: LngLat[], blocked: BorderCrossing[]): { c: BorderCrossing; i: number }[] {
+  const out: { c: BorderCrossing; i: number }[] = [];
+  for (const c of blocked) {
+    const n = nearestOnLine(coords, [c.lon, c.lat]);
+    if (n.km <= passesKm(c)) out.push({ c, i: n.i });
+  }
+  return out;
+}
+
 export interface RouteSet {
   trips: VTrip[];
-  /** a No-Go zónák elkerüléséhez kizárt pontok */
+  /** a No-Go zónák / lezárt átkelők elkerüléséhez kizárt pontok */
   exclude: Excl[];
   /** zónák, amelyeket nem sikerült / nem lehet elkerülni */
   unavoidable: string[];
+  /** lezárt átkelők, amelyeket nem sikerült elkerülni */
+  crossingsFailed: string[];
 }
 
 /**
- * Kamion-útvonal(ak) a No-Go zónák elkerülésével: ha az útvonal belép egy zónába, a behatoló
- * szakasz útjait kizárjuk, és újratervezünk (legfeljebb 8 kör / 50 kizárt pont).
+ * Kamion-útvonal(ak) a No-Go zónák és a lezárt (feltételes) határátkelők elkerülésével: ha az
+ * útvonal belép egy zónába / áthalad egy lezárt átkelőn, a behatoló szakasz útjait kizárjuk, és
+ * újratervezünk (legfeljebb 10 kör / 50 kizárt pont).
  */
 export async function routeRequest(
   waypoints: Waypoint[],
   v: Vehicle,
   o: RouteOptions,
-  opts: { alternates?: boolean; light?: boolean } = {},
+  opts: { alternates?: boolean; light?: boolean; blocked?: BorderCrossing[] } = {},
 ): Promise<RouteSet> {
   const zones = buildZones(o.noGo);
-  const skip = unavoidableZones(zones, waypoints);
-  const avoid: Avoid = { points: [...(o.exclude ?? [])].slice(0, 50), polygons: nativePolygons(zones, skip) };
+  const blocked = opts.blocked ?? [];
+  const wpCc = zones.some((z) => z.country) ? await waypointCountries(waypoints) : undefined;
+  const skip = unavoidableZones(zones, waypoints, wpCc);
+  const avoid: Avoid = { points: [...(o.exclude ?? [])].slice(0, 50), polygons: nativePolygons(zones, skip, blocked, waypoints) };
   const breaks = waypoints.filter((w) => !w.via).length;
   const alternates = opts.alternates !== false && breaks === 2 && waypoints.length === 2 ? 2 : 0;
   const locs = waypoints.map(toLocation);
 
   let trips = await truckRoute(locs, v, o, alternates, avoid, opts.light);
   const failed = new Set<string>();
-  if (zones.length) {
-    for (let it = 0; it < 8; it++) {
-      const runs = intrusions(tripCoords(trips[0]), zones, skip);
-      if (!runs.length) break;
-      const coords = tripCoords(trips[0]);
+  const failedX = new Set<string>();
+  const violations = async (t: VTrip) => {
+    const coords = tripCoords(t);
+    const runs = zones.length ? await preciseRuns(coords, intrusions(coords, zones, skip), v, o) : [];
+    return { coords, runs, hits: crossingHits(coords, blocked) };
+  };
+  const clean = async (t: VTrip) => { const x = await violations(t); return !x.runs.length && !x.hits.length; };
+
+  if (zones.length || blocked.length) {
+    for (let it = 0; it < 10; it++) {
+      const { coords, runs, hits } = await violations(trips[0]);
+      if (!runs.length && !hits.length) break;
       const before = avoid.points.length;
-      for (const r of runs) for (const p of exclusionPoints(coords, r)) {
-        if (avoid.points.length >= 50) break;
+      const add = (p: LngLat) => {
+        if (avoid.points.length >= 50) return;
         if (!avoid.points.some((q) => Math.abs(q.lat - p[1]) < 1e-4 && Math.abs(q.lon - p[0]) < 1e-4)) avoid.points.push({ lat: p[1], lon: p[0] });
+      };
+      // a lezárt átkelő: az útvonal saját pontja az átkelőnél (és egy szomszédos pont), így a használt pályatest zárul le
+      for (const h of hits) { add(coords[h.i]); if (coords[h.i + 1]) add(coords[h.i + 1]); }
+      for (const r of runs) for (const p of exclusionPoints(coords, r)) add(p);
+      if (avoid.points.length === before) {
+        runs.forEach((r) => failed.add(r.zone.id));
+        hits.forEach((h) => failedX.add(h.c.id));
+        break;
       }
-      if (avoid.points.length === before) { runs.forEach((r) => failed.add(r.zone.id)); break; }
       try {
         trips = await truckRoute(locs, v, o, alternates, avoid, opts.light);
       } catch (e) {
-        // a kizárások után nincs út: marad az utolsó (zónát érintő) útvonal
-        if (e instanceof ValhallaError && e.status === 422) { runs.forEach((r) => failed.add(r.zone.id)); break; }
+        // a kizárások után nincs út: marad az utolsó (zónát / átkelőt érintő) útvonal
+        if (e instanceof ValhallaError && e.status === 422) {
+          avoid.points.splice(before);
+          runs.forEach((r) => failed.add(r.zone.id));
+          hits.forEach((h) => failedX.add(h.c.id));
+          break;
+        }
         throw e;
       }
-      if (it === 7) intrusions(tripCoords(trips[0]), zones, skip).forEach((r) => failed.add(r.zone.id));
+      if (it === 9) {
+        const x = await violations(trips[0]);
+        x.runs.forEach((r) => failed.add(r.zone.id));
+        x.hits.forEach((h) => failedX.add(h.c.id));
+      }
     }
-    // a zónát érintő alternatívák kiesnek (a fő útvonal marad)
-    trips = trips.filter((t, i) => i === 0 || !intrusions(tripCoords(t), zones, skip).length);
+    // a zónát / lezárt átkelőt érintő alternatívák kiesnek (a fő útvonal marad)
+    const keep = await Promise.all(trips.map((t, i) => (i === 0 ? true : clean(t))));
+    trips = trips.filter((_, i) => keep[i]);
   }
   if (!opts.light) {
     const extra = await corridorCandidate(waypoints, v, o, trips[0], avoid);
-    if (extra && !trips.some((t) => similar(t, extra)) && !(zones.length && intrusions(tripCoords(extra), zones, skip).length)) trips.push(extra);
+    if (extra && !trips.some((t) => similar(t, extra)) && (!(zones.length || blocked.length) || (await clean(extra)))) trips.push(extra);
   }
   const names = new Map(zones.map((z) => [z.id, z.name]));
   return {
     trips,
     exclude: avoid.points,
     unavoidable: [...new Set([...skip, ...failed])].map((id) => names.get(id) ?? id),
+    crossingsFailed: [...failedX],
   };
 }
 

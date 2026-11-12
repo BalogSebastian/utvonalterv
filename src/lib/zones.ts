@@ -90,9 +90,18 @@ function distToEdge(z: Zone, p: LngLat): number {
 }
 
 /** zóna, ami valamelyik felhasználói pontot tartalmazza: azt nem lehet elkerülni */
-export function unavoidableZones(zones: Zone[], wps: Waypoint[]): Set<string> {
+export function unavoidableZones(zones: Zone[], wps: Waypoint[], wpCountries?: (string | null)[]): Set<string> {
   const s = new Set<string>();
-  for (const z of zones) if (wps.some((w) => !w.ferry && inZone(z, [w.lon, w.lat]))) s.add(z.id);
+  for (const z of zones) {
+    const hit = wps.some((w, i) => {
+      if (w.ferry) return false;
+      // országzónánál a pont pontos országa dönt (a durva határ a határ mentén téved)
+      const cc = wpCountries?.[i];
+      if (z.country && cc) return cc === z.country;
+      return inZone(z, [w.lon, w.lat]);
+    });
+    if (hit) s.add(z.id);
+  }
   return s;
 }
 
@@ -102,6 +111,13 @@ export interface Intrusion { zone: Zone; a: number; b: number; km: number }
  * Az útvonal zónán belüli szakaszai. Az ország-határ (1:50m) pontatlansága miatt csak a
  * legalább 2 km hosszú és a határtól legalább ~0,8 km mélyre hatoló szakaszok számítanak.
  */
+/** a legalább ~0,8 km mélyen behatoló szakasz (a durva határ pontatlansága miatt) */
+export function deepRun(coords: LngLat[], z: Zone, a: number, b: number): boolean {
+  const step = Math.max(1, Math.floor((b - a) / 25));
+  for (let i = a; i <= b; i += step) if (distToEdge(z, coords[i]) > 0.8) return true;
+  return false;
+}
+
 export function intrusions(coords: LngLat[], zones: Zone[], skip: Set<string> = new Set()): Intrusion[] {
   const out: Intrusion[] = [];
   for (const z of zones) {

@@ -17,6 +17,10 @@ export async function POST(req: Request) {
   if (body.waypoints.some((w) => !w || !Number.isFinite(w.lat) || !Number.isFinite(w.lon))) {
     return Response.json({ error: "Hibás útpont." }, { status: 400 });
   }
+  const xs = body.options?.crossings;
+  if (xs !== undefined && (!Array.isArray(xs) || xs.length > 500 || xs.some((c) => !c || !Number.isFinite(c.lat) || !Number.isFinite(c.lon) || !Array.isArray(c.countries) || !Array.isArray(c.requireIn)))) {
+    return Response.json({ error: "Hibás határátkelő-lista." }, { status: 400 });
+  }
   try {
     const { routes, exclude } = await planRoutes(body);
     return Response.json({ routes, exclude, source: "Valhalla (OpenStreetMap)" });

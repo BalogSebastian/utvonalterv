@@ -10,7 +10,8 @@ import { DEFAULT_COSTS, VEHICLE_PRESETS } from "@/lib/presets";
 import { FERRIES, ferryById, ferryWaypoint } from "@/lib/ferries";
 import { COUNTRY_NAMES } from "@/lib/country-names";
 import { flag } from "@/lib/format";
-import type { CostInputs, EuroClass, FerryOverride, LngLat, NoGo, RouteOptions, RouteResult, Vehicle, Waypoint } from "@/lib/types";
+import { BUILTIN_CROSSINGS, MODE_LABEL } from "@/lib/crossings";
+import type { BorderCrossing, CargoKind, CostInputs, EuroClass, FerryOverride, LngLat, NoGo, RouteOptions, RouteResult, Vehicle, Waypoint } from "@/lib/types";
 
 const MapView = dynamic(() => import("./MapView"), {
   ssr: false,
@@ -37,6 +38,10 @@ interface Saved {
   waitBans?: boolean;
   fleet?: FleetItem[];
   defaultFleet?: string;
+  crossings?: BorderCrossing[];
+  crossingsOff?: string[];
+  /** Svájc alapértelmezett No-Go zóna – egyszer hozzáadva a régi beállításokhoz is */
+  chDefault?: boolean;
 }
 
 function loadSaved(): Saved {
@@ -53,6 +58,13 @@ function loadCosts(saved: Saved): CostInputs {
   if (!c) return DEFAULT_COSTS;
   if (c.vehicleDaily === undefined) return { ...DEFAULT_COSTS, fuelPrice: c.fuelPrice ?? DEFAULT_COSTS.fuelPrice, driverHourly: c.driverHourly ?? DEFAULT_COSTS.driverHourly, eurHuf: c.eurHuf ?? DEFAULT_COSTS.eurHuf };
   return { ...DEFAULT_COSTS, ...c };
+}
+
+/** a régi mentésekbe egyszer bekerül Svájc No-Go zónaként (utána kivehető) */
+function initialNoGo(saved: Saved): NoGo {
+  const n = saved.noGo ?? { countries: [], areas: [] };
+  if (saved.chDefault || n.countries.includes("CH")) return n;
+  return { ...n, countries: ["CH", ...n.countries] };
 }
 
 const QUICK_NOGO = ["CH", "AT", "DE", "FR", "IT", "GB", "RS"];
@@ -86,7 +98,9 @@ export default function Planner() {
   const [costs, setCosts] = useState<CostInputs>(() => loadCosts(saved));
   const [options, setOptions] = useState<RouteOptions>(() => ({
     avoidTolls: false, avoidHighways: false, departure: nextDeparture(),
-    noGo: saved.noGo ?? { countries: [], areas: [] },
+    noGo: initialNoGo(saved),
+    crossings: saved.crossings ?? [],
+    crossingsOff: saved.crossingsOff ?? [],
     ferryOverrides: saved.ferryOverrides ?? {},
     flexRules: saved.flexRules ?? true,
     waitBans: saved.waitBans ?? true,
@@ -111,21 +125,44 @@ export default function Planner() {
   const [pickIdx, setPickIdx] = useState<number | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
   const [keepView, setKeepView] = useState(false);
+  /** határátkelő kijelölése a térképen */
+  const [crossPick, setCrossPick] = useState(false);
+  const [focus, setFocus] = useState<{ lat: number; lon: number; t: number } | null>(null);
+  /** a kiszámolt útvonal pontjai (a sofőrnek küldéshez) */
+  const [routeWps, setRouteWps] = useState<Waypoint[]>([]);
 
   useEffect(() => {
     try {
       localStorage.setItem(LS, JSON.stringify({
         vehicle, costs, fleet, defaultFleet,
         noGo: options.noGo, ferryOverrides: options.ferryOverrides, flexRules: options.flexRules, waitBans: options.waitBans,
+        crossings: options.crossings, crossingsOff: options.crossingsOff, chDefault: true,
       } satisfies Saved));
     } catch { /* privát mód */ }
-  }, [vehicle, costs, fleet, defaultFleet, options.noGo, options.ferryOverrides, options.flexRules, options.waitBans]);
+  }, [vehicle, costs, fleet, defaultFleet, options.noGo, options.ferryOverrides, options.flexRules, options.waitBans, options.crossings, options.crossingsOff]);
 
   const setWp = (i: number, w: Waypoint | null) => setWaypoints((ws) => ws.map((x, j) => (j === i ? w : x)));
 
+  const addCrossingAt = useCallback(async (lat: number, lon: number) => {
+    setCrossPick(false);
+    const id = `x${uid()}`;
+    const item: BorderCrossing = { id, name: `${lat.toFixed(4)}, ${lon.toFixed(4)}`, lat, lon, countries: [], requireIn: [], mode: "any" };
+    setOptions((o) => ({ ...o, crossings: [...(o.crossings ?? []), item] }));
+    const patch = (p: Partial<BorderCrossing>) => setOptions((o) => ({ ...o, crossings: (o.crossings ?? []).map((c) => (c.id === id ? { ...c, ...p } : c)) }));
+    try {
+      const [b, g] = await Promise.all([
+        fetch(`/api/border?lat=${lat}&lon=${lon}`).then((r) => r.json()),
+        fetch(`/api/geocode?lat=${lat}&lon=${lon}&place=1`).then((r) => r.json()).catch(() => ({})),
+      ]);
+      const countries = [b.cc, b.neighbors?.[0]].filter(Boolean) as string[];
+      const place = (g.results?.[0]?.label as string | undefined)?.split(/[—,]/)[0].trim();
+      patch({ countries, requireIn: countries, ...(place ? { name: `${place} átkelő` } : {}) });
+    } catch { /* kézzel állítható */ }
+  }, []);
+
   const onPick = useCallback(async (lat: number, lon: number) => {
     const i = pickIdx;
-    if (i === null) return;
+    if (i === null) { if (crossPick) void addCrossingAt(lat, lon); return; }
     setPickIdx(null);
     const fallback = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
     setWaypoints((ws) => ws.map((x, j) => (j === i ? { lat, lon, label: fallback } : x)));
@@ -135,7 +172,7 @@ export default function Planner() {
       const label = j.results?.[0]?.label;
       if (label) setWaypoints((ws) => ws.map((x, k) => (k === i && x?.lat === lat ? { ...x, label } : x)));
     } catch { /* marad a koordináta */ }
-  }, [pickIdx]);
+  }, [pickIdx, crossPick, addCrossingAt]);
 
   const ready = waypoints.every(Boolean);
 
@@ -153,6 +190,7 @@ export default function Planner() {
       const j = await res.json().catch(() => ({ error: `A szerver hibás választ adott (HTTP ${res.status}).` }));
       if (!res.ok) throw new Error(j.error ?? "Ismeretlen hiba");
       setRoutes(j.routes);
+      setRouteWps(wpsIn as Waypoint[]);
       setExclude(j.exclude ?? []);
       setParkStatus("");
       setPlans(carry ? Object.fromEntries((j.routes as RouteResult[]).map((_, i) => [i, carry])) : {});
@@ -180,7 +218,7 @@ export default function Planner() {
   }, []);
 
   const share = async () => {
-    const payload = btoa(encodeURIComponent(JSON.stringify({ w: waypoints, v: vehicle, o: { avoidTolls: options.avoidTolls, avoidHighways: options.avoidHighways, noGo: options.noGo } })));
+    const payload = btoa(encodeURIComponent(JSON.stringify({ w: waypoints, v: vehicle, o: { avoidTolls: options.avoidTolls, avoidHighways: options.avoidHighways, noGo: options.noGo, crossings: options.crossings, crossingsOff: options.crossingsOff } })));
     const url = `${window.location.origin}${window.location.pathname}#s=${payload}`;
     try { await navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 2000); }
     catch { window.prompt("Másold ki a linket:", url); }
@@ -375,6 +413,49 @@ export default function Planner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [noGoKey]);
 
+  // --- feltételes határátkelők ---
+  const crossings = options.crossings ?? [];
+  const crossingsOff = options.crossingsOff ?? [];
+  const setCrossing = (id: string, p: Partial<BorderCrossing>) => setOptions((o) => ({ ...o, crossings: (o.crossings ?? []).map((c) => (c.id === id ? { ...c, ...p } : c)) }));
+  const removeCrossing = (id: string) => setOptions((o) => ({ ...o, crossings: (o.crossings ?? []).filter((c) => c.id !== id) }));
+  const toggleBuiltin = (id: string) => setOptions((o) => ({ ...o, crossingsOff: (o.crossingsOff ?? []).includes(id) ? (o.crossingsOff ?? []).filter((x) => x !== id) : [...(o.crossingsOff ?? []), id] }));
+  const exportCrossings = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ crossings }, null, 2)], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "hatarakelok.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importCrossings = async (file: File) => {
+    try {
+      const j = JSON.parse(await file.text());
+      const list = (Array.isArray(j) ? j : j.crossings) as BorderCrossing[];
+      if (!Array.isArray(list)) throw new Error();
+      const ok = list.filter((c) => c && typeof c.id === "string" && Number.isFinite(c.lat) && Number.isFinite(c.lon) && Array.isArray(c.countries) && Array.isArray(c.requireIn));
+      setOptions((o) => {
+        const byId = new Map((o.crossings ?? []).map((c) => [c.id, c]));
+        for (const c of ok) byId.set(c.id, { ...c, mode: c.mode ?? "any" });
+        return { ...o, crossings: [...byId.values()] };
+      });
+      setError(null);
+    } catch {
+      setError("A fájl nem érvényes határátkelő-lista (JSON).");
+    }
+  };
+  const crossStatus = useMemo(() => new Map((routes[selected]?.crossings ?? []).map((c) => [c.id, c])), [routes, selected]);
+  // az átkelők / a rakodási pontok változásakor újraszámolás
+  const crossKey = JSON.stringify([crossings, crossingsOff, waypoints.map((w) => w?.cargo ?? "")]);
+  const lastCross = useRef(crossKey);
+  useEffect(() => {
+    if (lastCross.current === crossKey) return;
+    lastCross.current = crossKey;
+    if (!rawRoutes.length || !waypoints.every(Boolean)) return;
+    const t = setTimeout(() => { void calc(undefined, undefined, true); }, 700);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [crossKey]);
+
   // --- komp / vasút ---
   const addFerry = () => {
     const line = ferryById(ferrySel);
@@ -483,7 +564,9 @@ export default function Planner() {
                     value={w}
                     picking={pickIdx === i}
                     onChange={(nw) => setWp(i, nw)}
-                    onPickToggle={() => setPickIdx(pickIdx === i ? null : i)}
+                    onPickToggle={() => { setCrossPick(false); setPickIdx(pickIdx === i ? null : i); }}
+                    cargo={w && !w.via && !w.ferry ? (w.cargo ?? (first ? "load" : last ? "unload" : "both")) : undefined}
+                    onCargo={(k: CargoKind) => w && setWp(i, { ...w, cargo: k })}
                     onRemove={!first && !last ? () => (rawRoutes.length && w ? onWaypointRemove(i) : setWaypoints((ws) => ws.filter((_, j) => j !== i))) : undefined}
                   />
                 );
@@ -593,6 +676,79 @@ export default function Planner() {
             <p className="mt-2 text-[11px] leading-snug text-slate-500">Ha egy pont a zónán belül van (pl. a cél Svájcban), azt a zónát nem lehet elkerülni – erről figyelmeztetést kapsz.</p>
           </Card>
 
+          <Card icon="ban" title="Feltételes határátkelők" hint="Csak akkor használható, ha a fuvarnak van felrakása / lerakása az adott országban – különben az útvonal elkerüli"
+            right={crossings.length + BUILTIN_CROSSINGS.length > 0 ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800 dark:bg-amber-950 dark:text-amber-300">{crossings.filter((c) => !c.disabled).length + BUILTIN_CROSSINGS.filter((c) => !crossingsOff.includes(c.id)).length}</span> : undefined}>
+            {BUILTIN_CROSSINGS.length > 0 && (
+              <ul className="mb-2 space-y-1 text-xs">
+                {BUILTIN_CROSSINGS.map((c) => {
+                  const st = crossStatus.get(c.id);
+                  return (
+                    <li key={c.id} className={`flex items-center gap-2 rounded-lg px-2.5 py-1.5 ${crossingsOff.includes(c.id) ? "bg-slate-100 opacity-60 dark:bg-slate-800" : "bg-amber-50 dark:bg-amber-950/30"}`}>
+                      <span>🛂</span>
+                      <button className="min-w-0 flex-1 truncate text-left" onClick={() => setFocus({ lat: c.lat, lon: c.lon, t: Date.now() })} title={c.note}>
+                        <b>{c.name}</b> {c.countries.map(flag).join("–")} · {c.requireIn.map((x) => COUNTRY_NAMES[x] ?? x).join("/")} {MODE_LABEL[c.mode]}
+                        {st && <span className={st.used && !st.allowed ? "text-red-600" : st.allowed ? "text-emerald-600" : "text-slate-500"}> · {st.used ? (st.allowed ? "használja" : "érinti!") : st.allowed ? "használható" : "elkerülve"}</span>}
+                      </button>
+                      <input type="checkbox" checked={!crossingsOff.includes(c.id)} onChange={() => toggleBuiltin(c.id)} title="Érvényes" />
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {crossings.length > 0 && (
+              <ul className="space-y-1.5 text-xs">
+                {crossings.map((c) => {
+                  const st = crossStatus.get(c.id);
+                  const sides = c.countries.length ? c.countries : [];
+                  return (
+                    <li key={c.id} className={`rounded-lg px-2.5 py-2 ${c.disabled ? "bg-slate-100 opacity-60 dark:bg-slate-800" : "bg-amber-50 dark:bg-amber-950/30"}`}>
+                      <div className="flex items-center gap-2">
+                        <button title="Megmutatás a térképen" onClick={() => setFocus({ lat: c.lat, lon: c.lon, t: Date.now() })}>🛂</button>
+                        <input className="min-w-0 flex-1 bg-transparent font-medium outline-none" value={c.name} onChange={(e) => setCrossing(c.id, { name: e.target.value })} />
+                        <span className="shrink-0">{sides.map(flag).join("–")}</span>
+                        <input type="checkbox" checked={!c.disabled} onChange={(e) => setCrossing(c.id, { disabled: !e.target.checked })} title="Érvényes" />
+                        <button className="text-slate-400 hover:text-red-600" title="Törlés" onClick={() => removeCrossing(c.id)}>✕</button>
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        <span className="text-slate-500">Csak ha</span>
+                        <select className="field !py-0.5 !text-xs" value={c.mode} onChange={(e) => setCrossing(c.id, { mode: e.target.value as BorderCrossing["mode"] })}>
+                          <option value="any">felrakás vagy lerakás</option>
+                          <option value="load">felrakás</option>
+                          <option value="unload">lerakás</option>
+                        </select>
+                        <span className="text-slate-500">van itt:</span>
+                        {sides.map((cc) => (
+                          <button key={cc} onClick={() => setCrossing(c.id, { requireIn: c.requireIn.includes(cc) ? c.requireIn.filter((x) => x !== cc) : [...c.requireIn, cc] })}
+                            className={`rounded-full border px-2 py-0.5 ${c.requireIn.includes(cc) ? "border-amber-500 bg-white font-semibold text-amber-800 dark:bg-slate-900 dark:text-amber-300" : "border-slate-200 text-slate-400 line-through dark:border-slate-700"}`}>
+                            {flag(cc)} {COUNTRY_NAMES[cc] ?? cc}
+                          </button>
+                        ))}
+                        <select className="field !py-0.5 !text-xs" value="" title="Ország hozzáadása" onChange={(e) => e.target.value && setCrossing(c.id, { countries: [...sides, e.target.value], requireIn: [...c.requireIn, e.target.value] })}>
+                          <option value="">+</option>
+                          {Object.entries(COUNTRY_NAMES).filter(([cc]) => !sides.includes(cc)).sort((a, b) => a[1].localeCompare(b[1], "hu")).map(([cc, n]) => <option key={cc} value={cc}>{n}</option>)}
+                        </select>
+                      </div>
+                      {!c.requireIn.length && <div className="mt-1 text-amber-700">Nincs ország kijelölve: a két oldal bármelyikében elég a rakodás.</div>}
+                      {st && (
+                        <div className={`mt-1 ${st.used && !st.allowed ? "text-red-600" : st.allowed ? "text-emerald-700 dark:text-emerald-400" : "text-slate-500"}`}>
+                          {st.used ? (st.allowed ? "✅ " : "⛔ ") : st.allowed ? "➖ " : "↪ "}{st.reason}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              <button className={`btn ${crossPick ? "!border-amber-500 !bg-amber-50 !text-amber-800" : ""}`} onClick={() => { setPickIdx(null); setDrawMode(null); setCrossPick((x) => !x); }}>🛂 Átkelő kijelölése a térképen</button>
+              {crossings.length > 0 && <button className="chip text-xs" onClick={exportCrossings}>⬇ Export</button>}
+              <label className="chip cursor-pointer text-xs">⬆ Import<input type="file" accept="application/json,.json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) void importCrossings(f); e.target.value = ""; }} /></label>
+            </div>
+            <p className="mt-2 text-[11px] leading-snug text-slate-500">
+              Kattints pontosan az átkelőre (a határon átmenő útra). A rakodás típusát az útpontok mellett állíthatod (alapból: indulás = felrakás, érkezés = lerakás, köztes pont = mindkettő). A lista a böngészőben marad, és a megosztott linkkel együtt utazik; JSON-ként a kollégáknak is átadható.
+            </p>
+          </Card>
+
           <Card icon="ferry" title="Komp / vasút" hint="Pontos járat kiválasztása (pl. Dover–Calais, Hoek van Holland–Harwich, RoLa)">
             <div className="flex gap-2">
               <select className="field min-w-0 flex-1" value={ferrySel} onChange={(e) => setFerrySel(e.target.value)}>
@@ -678,7 +834,7 @@ export default function Planner() {
               <button className="btn w-full" onClick={share}>
                 <Ico name="link" /> {copied ? "Link a vágólapon ✓" : "Megosztható link másolása"}
               </button>
-              <Results routes={routes} selected={selected} onSelect={setSelected} costs={costs} onAddStop={onAddStop} onRemoveStop={onRemoveStop} onResetStops={onResetStops} edited={!!plans[selected]} onSnapParking={onSnapParking} parkStatus={parkStatus} />
+              <Results routes={routes} selected={selected} onSelect={setSelected} costs={costs} onAddStop={onAddStop} onRemoveStop={onRemoveStop} onResetStops={onResetStops} edited={!!plans[selected]} onSnapParking={onSnapParking} parkStatus={parkStatus} waypoints={routeWps} departure={options.departure} />
             </>
           )}
 
@@ -711,7 +867,7 @@ export default function Planner() {
           showRestrictions={showRestr}
           showParking={showParking}
           onContext={onContext}
-          pickMode={pickIdx}
+          pickMode={pickIdx ?? (crossPick ? -1 : null)}
           onPick={onPick}
           onSelectRoute={setSelected}
           onStopMove={onStopMove}
@@ -727,6 +883,10 @@ export default function Planner() {
           onDrawDone={onDrawDone}
           onDrawCancel={() => setDrawMode(null)}
           onRoutePreview={onRoutePreview}
+          crossings={[...BUILTIN_CROSSINGS.filter((c) => !crossingsOff.includes(c.id)), ...crossings.filter((c) => !c.disabled)]}
+          crossStatus={crossStatus}
+          focus={focus}
+          onPickCancel={() => { setPickIdx(null); setCrossPick(false); }}
         />
       </main>
     </div>

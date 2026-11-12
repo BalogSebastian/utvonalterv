@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import type { GeoJSONSource, Map as MLMap, Marker } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { LngLat, NoGoArea, RouteResult, Vehicle, Waypoint } from "@/lib/types";
+import type { BorderCrossing, CrossingUse, LngLat, NoGoArea, RouteResult, Vehicle, Waypoint } from "@/lib/types";
 import { cumulative, snapToRoute } from "@/lib/schedule";
 import { circleRing } from "@/lib/zones";
 
@@ -41,6 +41,12 @@ interface Props {
   onDrawCancel: () => void;
   /** élő előnézet az útvonal húzása közben */
   onRoutePreview?: (f: number, lat: number, lon: number) => Promise<LngLat[] | null>;
+  /** feltételes határátkelők és az állapotuk az aktuális útvonalon */
+  crossings?: BorderCrossing[];
+  crossStatus?: Map<string, CrossingUse>;
+  /** a térkép ide ugrik */
+  focus?: { lat: number; lon: number; t: number } | null;
+  onPickCancel?: () => void;
 }
 
 const EMPTY: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
@@ -72,7 +78,9 @@ function supportsWebGL2(): boolean {
 export default function MapView({
   waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onStopDrop, onWaypointDrag, onRouteDrag, onWaypointRemove, keepView,
   zoneCountries, zoneAreas, drawMode, circleKm, onDrawDone, onDrawCancel, onRoutePreview,
+  crossings = [], crossStatus, focus, onPickCancel,
 }: Props) {
+  const crossMarkers = useRef<Marker[]>([]);
   const drawRef = useRef({ drawMode, circleKm, onDrawDone, onDrawCancel });
   const previewRef = useRef(onRoutePreview);
   const [drawPts, setDrawPts] = useState<LngLat[]>([]);
@@ -370,6 +378,30 @@ export default function MapView({
     return () => { alive = false; };
   }, [zoneKey, zoneAreas, ready]);
 
+  // feltételes határátkelők
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    crossMarkers.current.forEach((m) => m.remove());
+    crossMarkers.current = [];
+    for (const c of crossings) {
+      const st = crossStatus?.get(c.id);
+      const bad = st && st.used && !st.allowed;
+      const blocked = st && !st.allowed;
+      const d = document.createElement("div");
+      d.textContent = "🛂";
+      d.title = `${c.name}${st ? ` – ${st.reason}` : ""}`;
+      d.style.cssText = `width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:13px;box-shadow:0 1px 4px rgba(0,0,0,.4);background:${bad ? "#fee2e2" : blocked ? "#fef3c7" : st ? "#dcfce7" : "#fff"};border:2px solid ${bad ? "#dc2626" : blocked ? "#d97706" : st ? "#16a34a" : "#d97706"}`;
+      crossMarkers.current.push(new maplibregl.Marker({ element: d }).setLngLat([c.lon, c.lat]).addTo(map));
+    }
+  }, [crossings, crossStatus, ready]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready || !focus) return;
+    map.flyTo({ center: [focus.lon, focus.lat], zoom: Math.max(map.getZoom(), 13) });
+  }, [focus, ready]);
+
   // markers
   useEffect(() => {
     const map = mapRef.current;
@@ -613,7 +645,8 @@ export default function MapView({
       )}
       {pickMode !== null && (
         <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-slate-900/90 px-4 py-2 text-sm text-white shadow">
-          Kattints a térképen a pont kijelöléséhez
+          {pickMode === -1 ? "Kattints pontosan a határátkelőre (a határon átmenő útra)" : "Kattints a térképen a pont kijelöléséhez"}
+          {onPickCancel && <button className="ml-2 rounded-full bg-white/15 px-2.5 py-0.5 text-xs" onClick={onPickCancel}>Mégse</button>}
         </div>
       )}
       {showRestrictions && restrStatus && (
@@ -641,6 +674,7 @@ export default function MapView({
         <div><span className="mr-1.5 inline-block h-1.5 w-5 rounded-sm bg-slate-500 align-middle" />Alternatíva</div>
         <div><span className="mr-1.5 inline-block w-5 border-t-2 border-dashed border-teal-600 align-middle" />Komp / vasút</div>
         <div><span className="mr-1.5 inline-block h-2.5 w-5 rounded-sm border border-dashed border-red-600 bg-red-600/10 align-middle" />No-Go zóna</div>
+        {crossings.length > 0 && <div><span className="mr-1.5 inline-block w-5 text-center align-middle">🛂</span>Feltételes átkelő</div>}
         <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">Az útvonal megfogható és húzható</div>
       </div>
     </div>
