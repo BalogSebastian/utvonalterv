@@ -128,6 +128,8 @@ export default function Planner() {
   /** határátkelő kijelölése a térképen */
   const [crossPick, setCrossPick] = useState(false);
   const [focus, setFocus] = useState<{ lat: number; lon: number; t: number } | null>(null);
+  const [hlSection, setHlSection] = useState<number | null>(null);
+  const [zoomSection, setZoomSection] = useState<{ i: number; t: number } | null>(null);
   /** a kiszámolt útvonal pontjai (a sofőrnek küldéshez) */
   const [routeWps, setRouteWps] = useState<Waypoint[]>([]);
 
@@ -834,7 +836,7 @@ export default function Planner() {
               <button className="btn w-full" onClick={share}>
                 <Ico name="link" /> {copied ? "Link a vágólapon ✓" : "Megosztható link másolása"}
               </button>
-              <Results routes={routes} selected={selected} onSelect={setSelected} costs={costs} onAddStop={onAddStop} onRemoveStop={onRemoveStop} onResetStops={onResetStops} edited={!!plans[selected]} onSnapParking={onSnapParking} parkStatus={parkStatus} waypoints={routeWps} departure={options.departure} />
+              <Results routes={routes} selected={selected} onSelect={setSelected} costs={costs} onAddStop={onAddStop} onRemoveStop={onRemoveStop} onResetStops={onResetStops} edited={!!plans[selected]} onSnapParking={onSnapParking} parkStatus={parkStatus} waypoints={routeWps} departure={options.departure} activeSection={hlSection} onSectionHover={setHlSection} onSectionFocus={(i) => setZoomSection({ i, t: Date.now() })} />
             </>
           )}
 
@@ -886,6 +888,8 @@ export default function Planner() {
           crossings={[...BUILTIN_CROSSINGS.filter((c) => !crossingsOff.includes(c.id)), ...crossings.filter((c) => !c.disabled)]}
           crossStatus={crossStatus}
           focus={focus}
+          highlightSection={hlSection}
+          zoomSection={zoomSection}
           onPickCancel={() => { setPickIdx(null); setCrossPick(false); }}
         />
       </main>

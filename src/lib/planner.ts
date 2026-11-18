@@ -1,12 +1,13 @@
 import { COUNTRY_NAMES, countryAt } from "./countries";
 import { decodePolyline, encodePolyline } from "./polyline";
-import { TOLL_RULES, fixedFee, isTolledEdge, ratePerKm } from "./tolls";
+import { TOLL_RULES, fixedFee, isTolledFor, rateClassFor, ratePerKm } from "./tolls";
 import { SPECIALS, specialFee } from "./specials";
 import { ferryPath, ferryPrice, matchFerry, pathKm, splitByFerries, type FerryLine } from "./ferries";
 import { buildZones, inZone } from "./zones";
 import { activeCrossings, crossingAllowed, nearestOnLine, passesKm } from "./crossings";
 import { waypointCountries } from "./wpcountry";
 import { applyPlan, autoPlan } from "./schedule";
+import { buildSections, truckSpeed, type SignAt } from "./sections";
 import { DEFAULT_COSTS } from "./presets";
 import {
   routeRequest, traceEdges, type Excl, type VLeg, type VTrip,
@@ -30,6 +31,11 @@ interface EdgeLike {
   i1: number;
   /** komp / autós vonat él */
   ferry?: boolean;
+  /** Valhalla `use`: road, ramp, turn_channel… */
+  use?: string;
+  /** a routing-szerver éle sebessége és a kihelyezett korlát (km/h) */
+  speed?: number;
+  limit?: number;
 }
 
 /** Közel egymás melletti pontok ritkítása a térképes megjelenítéshez (~12 m). */
@@ -60,26 +66,43 @@ function refName(names?: string[]): string | undefined {
   );
 }
 
-/** reális kamionos átlagsebesség (km/h) útosztályonként */
-const TRUCK_SPEED: Record<string, number> = {
-  motorway: 82, trunk: 72, primary: 62, secondary: 52, tertiary: 45,
-  unclassified: 38, residential: 30, service_other: 25,
-};
-
-const CHUNK_KM = Number(process.env.TRACE_CHUNK_KM) || 300;
+const CHUNK_KM = Number(process.env.TRACE_CHUNK_KM) || 150;
 
 /** Egy leg élei, manőverhatáron ~300 km-es darabokban lekérve (a publikus szerver 1000 km-es limitje miatt). */
 async function legEdges(
   leg: VLeg,
   v: RouteRequest["vehicle"],
   o: RouteRequest["options"],
-): Promise<{ coords: LngLat[]; edges: EdgeLike[]; exact: boolean }> {
+): Promise<{ coords: LngLat[]; edges: EdgeLike[]; exact: boolean; signs: SignAt[] }> {
   const coords = decodePolyline(leg.shape);
   const chunks: { from: number; to: number; ms: typeof leg.maneuvers }[] = [];
   let cur: typeof leg.maneuvers = [];
   let curKm = 0;
+  // a hosszú manővereket (pl. 180 km egy autópályán) a geometria mentén ~CHUNK_KM-es darabokra vágjuk:
+  // a szerver pontos illesztése (edge_walk) nagyon hosszú egybefüggő szakaszon meghiúsulhat
+  const pseudo: typeof leg.maneuvers = [];
   for (const m of leg.maneuvers) {
     if (m.end_shape_index <= m.begin_shape_index) continue;
+    if (m.length <= CHUNK_KM * 1.2) { pseudo.push(m); continue; }
+    const parts = Math.ceil(m.length / CHUNK_KM);
+    let from = m.begin_shape_index;
+    let acc = 0;
+    let pk = 1;
+    for (let i = m.begin_shape_index; i < m.end_shape_index; i++) {
+      const [x1, y1] = coords[i];
+      const [x2, y2] = coords[i + 1];
+      acc += Math.hypot((x2 - x1) * Math.cos(((y1 + y2) / 2) * (Math.PI / 180)) * 111.32, (y2 - y1) * 110.57);
+      const last = i + 1 === m.end_shape_index;
+      if (last || (pk < parts && acc >= (m.length / parts) * 0.999 * 1)) {
+        const km = last ? m.length - (m.length / parts) * (pk - 1) : acc;
+        pseudo.push({ ...m, begin_shape_index: from, end_shape_index: i + 1, length: km, time: (m.time * km) / m.length });
+        from = i + 1;
+        acc = 0;
+        pk++;
+      }
+    }
+  }
+  for (const m of pseudo) {
     cur.push(m);
     curKm += m.length;
     if (curKm >= CHUNK_KM) {
@@ -92,26 +115,54 @@ async function legEdges(
 
   let exact = true;
   const edges: EdgeLike[] = [];
-  const results: PromiseSettledResult<Awaited<ReturnType<typeof traceEdges>>>[] = [];
+  type Traced = Awaited<ReturnType<typeof traceEdges>>;
+  type Piece = { from: number; res?: Traced; ms: typeof leg.maneuvers };
+  const sub = (ms: typeof leg.maneuvers) => ({ ...leg, shape: encodePolyline(coords.slice(ms[0].begin_shape_index, ms[ms.length - 1].end_shape_index + 1)) });
+  /**
+   * Egy darab élei: pontos (edge_walk) illesztés; ha a szerver nem találja az utat, a darabot
+   * félbevágjuk és úgy próbáljuk újra, végül a közelítő (walk_or_snap) illesztés jön.
+   */
+  const trace = async (ms: typeof leg.maneuvers, depth = 0): Promise<Piece[]> => {
+    try {
+      const res = await traceEdges(sub(ms), v, o);
+      if (res.edges?.length) return [{ from: ms[0].begin_shape_index, res, ms }];
+    } catch (e) {
+      if (ms.length > 1 && depth < 3) {
+        const mid = Math.ceil(ms.length / 2);
+        const [x, y] = await Promise.all([trace(ms.slice(0, mid), depth + 1), trace(ms.slice(mid), depth + 1)]);
+        return [...x, ...y];
+      }
+      try {
+        const res = await traceEdges(sub(ms), v, o, "walk_or_snap");
+        if (res.edges?.length) return [{ from: ms[0].begin_shape_index, res, ms }];
+      } catch (e2) {
+        void e2; // marad a manőver-szintű tartalék
+      }
+      void e;
+    }
+    return [{ from: ms[0].begin_shape_index, ms }];
+  };
+  const pieces: Piece[] = [];
   const CONC = 3;
   for (let i = 0; i < chunks.length; i += CONC) {
-    const batch = chunks.slice(i, i + CONC).map((c) =>
-      traceEdges({ ...leg, shape: encodePolyline(coords.slice(c.from, c.to + 1)) }, v, o),
-    );
-    results.push(...(await Promise.allSettled(batch)));
+    const batch = await Promise.all(chunks.slice(i, i + CONC).map((c) => trace(c.ms)));
+    pieces.push(...batch.flat());
   }
   // a ferry élek a 'use' mezőből jönnek; manőver-szinten a típus (28/29 = komp be/ki)
-  chunks.forEach((c, ci) => {
-    const t = results[ci];
-    if (t.status === "fulfilled" && t.value.edges?.length) {
-      const sh = decodePolyline(t.value.shape);
-      const admins = t.value.admins ?? [];
-      for (const e of t.value.edges) {
+  for (const c of pieces) {
+    if (c.res) {
+      const sh = decodePolyline(c.res.shape);
+      const admins = c.res.admins ?? [];
+      // a darab élhosszainak összege a routing-szerver saját manőver-hosszához igazítva (a félig lefedett szélső élek miatt)
+      const want = c.ms.reduce((t, m) => t + m.length, 0);
+      const have = c.res.edges.reduce((t, e) => t + e.length, 0);
+      const k = have > 0 && want > 0 && Math.abs(want / have - 1) < 0.15 ? want / have : 1;
+      for (const e of c.res.edges) {
         const ai = e.end_node?.admin_index;
         const cc = ai !== undefined ? admins[ai]?.country_code : undefined;
         const ferry = e.use === "ferry" || e.use === "rail-ferry";
         edges.push({
-          ferry, km: e.length, toll: !!e.toll, roadClass: e.road_class, name: refName(e.names), names: e.names, cc: cc || undefined,
+          ferry, km: e.length * k, toll: !!e.toll, roadClass: e.road_class, use: e.use, speed: e.speed, limit: typeof e.speed_limit === "number" ? e.speed_limit : undefined, name: refName(e.names), names: e.names, cc: cc || undefined,
           a: sh[e.begin_shape_index], b: sh[e.end_shape_index],
           i0: c.from + e.begin_shape_index, i1: c.from + e.end_shape_index,
         });
@@ -120,14 +171,18 @@ async function legEdges(
       exact = false;
       for (const m of c.ms) {
         edges.push({
-          ferry: !!m.ferry, km: m.length, toll: !!m.toll, roadClass: m.highway ? "motorway" : undefined, name: m.street_names?.[0],
+          ferry: !!m.ferry, km: m.length, toll: !!m.toll, roadClass: m.highway ? "motorway" : undefined, name: m.street_names?.[0], names: m.street_names,
           a: coords[m.begin_shape_index], b: coords[m.end_shape_index],
           i0: m.begin_shape_index, i1: m.end_shape_index,
         });
       }
     }
-  });
-  return { coords, edges, exact };
+  }
+  const txt = (xs?: { text: string }[]) => xs?.map((x) => x.text).filter(Boolean).join(" / ") || undefined;
+  const signs: SignAt[] = leg.maneuvers
+    .filter((m) => m.sign && (m.sign.exit_number_elements?.length || m.sign.exit_toward_elements?.length))
+    .map((m) => ({ i: m.begin_shape_index, exit: txt(m.sign!.exit_number_elements), toward: txt(m.sign!.exit_toward_elements) }));
+  return { coords, edges, exact, signs };
 }
 
 /** egy útvonal-rész: közúti (Valhalla) vagy kiválasztott komp / vasúti járat */
@@ -149,6 +204,7 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
   let valhallaRoadMin = 0;
   const chosen: { line: FerryLine; reverse: boolean; i0: number; i1: number }[] = [];
   const maneuvers: RouteResult["maneuvers"] = [];
+  const signs: SignAt[] = [];
 
   for (const part of parts) {
     const base = fullCoords.length ? fullCoords.length - 1 : 0;
@@ -169,6 +225,7 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
       const r = await legEdges(leg, v, o);
       if (!r.exact) accuracy = "maneuver";
       for (const e of r.edges) edges.push({ ...e, i0: e.i0 + b0, i1: e.i1 + b0 });
+      signs.push(...r.signs.map((x) => ({ ...x, i: x.i + b0 })));
       fullCoords.push(...(fullCoords.length ? r.coords.slice(1) : r.coords));
       maneuvers.push(...leg.maneuvers.map((m) => ({ text: m.instruction, km: m.length, min: m.time / 60, street: m.street_names?.[0] })));
     }
@@ -201,7 +258,34 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
   const zones = buildZones(o.noGo);
   const zoneKm = new Map<string, number>();
   const autoFerries: { i0: number; i1: number; km: number }[] = [];
-  for (const e of edges) {
+  // országok + díjköteles élek előre: a felhajtók / lehajtók (ramp) a szomszédos díjköteles szakasz részei
+  const ccs: (string | undefined)[] = [];
+  const tolledAt: boolean[] = [];
+  {
+    let cur = curCountry;
+    for (const e of edges) {
+      if (e.ferry) { ccs.push(undefined); tolledAt.push(false); continue; }
+      const mid: LngLat = [(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2];
+      cur = e.cc ?? countryAt(mid) ?? countryAt(e.a) ?? cur;
+      ccs.push(cur);
+      const rule = TOLL_RULES[cur];
+      tolledAt.push(rule ? isTolledFor(cur, rule, { roadClass: e.roadClass, osmToll: e.toll, names: e.names, use: e.use, at: mid }) : false);
+    }
+    const isRamp = (e: EdgeLike) => e.use === "ramp" || e.use === "turn_channel";
+    // egy menetben, mindkét irányban: a ramp díjköteles, ha a szomszédos nem-ramp él az ugyanabban az országban
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < edges.length; i++) {
+        const e = edges[i];
+        if (e.ferry || tolledAt[i] || !isRamp(e) || !TOLL_RULES[ccs[i]!]?.classes.length) continue;
+        const near = [i - 1, i + 1].some((j) => edges[j] && !edges[j].ferry && ccs[j] === ccs[i] && tolledAt[j] && !isRamp(edges[j]) && edges[j].roadClass !== undefined && ["motorway", "trunk"].includes(edges[j].roadClass!));
+        if (near) tolledAt[i] = true;
+      }
+    }
+  }
+
+  const edgeCost: number[] = edges.map(() => 0);
+  for (let ei = 0; ei < edges.length; ei++) {
+    const e = edges[ei];
     if (e.ferry) {
       // a routing által választott (nem a felhasználó által kijelölt) komp
       if (!chosen.some((x) => e.i0 >= x.i0 && e.i1 <= x.i1)) {
@@ -227,8 +311,10 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
       }
     }
     const rule = TOLL_RULES[cc];
-    const tolled = rule ? isTolledEdge(rule, e.roadClass, e.toll) : false;
-    const cost = tolled && rule && !replaced ? e.km * ratePerKm(rule, v, e.roadClass, c.eurHuf, mid, depMs) : 0;
+    const tolled = tolledAt[ei];
+    const rateClass = rateClassFor(cc, { roadClass: e.roadClass, osmToll: e.toll, names: e.names });
+    const cost = tolled && rule && !replaced ? e.km * ratePerKm(rule, v, rateClass, c.eurHuf, mid, depMs) : 0;
+    edgeCost[ei] = cost;
     let last = visits[visits.length - 1];
     if (!last || last.country !== cc) {
       last = { country: cc, km: 0, tollKm: 0, startKm: cumKm, cost: 0 };
@@ -347,16 +433,18 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
 
   // --- idő-profil: útvonal-arány → vezetési óra (kamionos sebességmodell útosztályonként) ---
   // Ha nincs élszintű adat: a Valhalla ideje +20%.
-  const roadModelMin = edges.reduce((sum, e) => sum + (e.ferry ? 0 : (e.km / (TRUCK_SPEED[e.roadClass ?? ""] ?? 40)) * 60), 0);
+  // élenként: a routing-szerver sebessége / kihelyezett korlát, az ország kamion-sebességkorlátjával (sections.ts)
+  const edgeH: number[] = edges.map((e, i) => (e.ferry ? 0 : e.km / truckSpeed(e, ccs[i])));
+  const roadModelMin = edgeH.reduce((sum, h) => sum + h * 60, 0);
   const scale = accuracy === "edge" || !roadModelMin ? 1 : (valhallaRoadMin * 1.2) / roadModelMin;
   const profile: TimeProfile = [[0, 0]];
   let hAcc = 0;
   let lastF = 0;
-  for (const e of edges) {
-    if (!e.ferry) hAcc += ((e.km / (TRUCK_SPEED[e.roadClass ?? ""] ?? 40)) * scale);
+  edges.forEach((e, i) => {
+    if (!e.ferry) { edgeH[i] *= scale; hAcc += edgeH[i]; }
     const f = fAt(e.i1);
     if (f - lastF > 0.0015 || e.ferry) { profile.push([f, hAcc]); lastF = f; }
-  }
+  });
   if (profile[profile.length - 1][0] < 1) profile.push([1, hAcc]);
   const drivingMin = hAcc * 60;
 
@@ -422,6 +510,7 @@ async function analyse(parts: Part[], req: RouteRequest, id: number, unavoidable
     ferry: ferries.length > 0,
     tollAccuracy: accuracy,
     maneuvers,
+    sections: buildSections(edges, ccs, tolledAt, edgeH, edgeCost, fAt, signs),
   };
   // alap menetrend (szünetek, pihenők, tilalmak, érkezés) – a kliens ugyanezzel számol újra
   return applyPlan(base, autoPlan(base, o, v.weight), o, v.weight, c);

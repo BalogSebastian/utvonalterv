@@ -401,9 +401,12 @@ export function applyPlan(route: RouteResult, plan: PlanStop[], o: SchedOpts, we
   const last = countries[countries.length - 1]?.country;
   const off = last ? TZ_OFFSET[last] ?? 0 : 0;
 
+  const sections = (route.sections ?? []).map((x) => ({ ...x, start: iso(wall(x.f0)), end: iso(wall(x.f1)) }));
+
   return {
     ...route,
     countries,
+    sections,
     stops: sim.stops,
     warnings: [...ruleWarnings, ...bans],
     schedule: {

@@ -5,7 +5,8 @@ import * as maplibregl from "maplibre-gl";
 import type { GeoJSONSource, Map as MLMap, Marker } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { BorderCrossing, CrossingUse, LngLat, NoGoArea, RouteResult, Vehicle, Waypoint } from "@/lib/types";
-import { cumulative, snapToRoute } from "@/lib/schedule";
+import { cumulative, pointAtFraction, snapToRoute } from "@/lib/schedule";
+import { sliceFraction } from "@/lib/sections";
 import { circleRing } from "@/lib/zones";
 
 // A worker a public/ mappából jön (a Turbopack nem tudja automatikusan becsomagolni).
@@ -47,6 +48,10 @@ interface Props {
   /** a térkép ide ugrik */
   focus?: { lat: number; lon: number; t: number } | null;
   onPickCancel?: () => void;
+  /** a listában kiemelt útszakasz indexe */
+  highlightSection?: number | null;
+  /** erre a szakaszra közelítsen rá a térkép */
+  zoomSection?: { i: number; t: number } | null;
 }
 
 const EMPTY: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
@@ -78,7 +83,7 @@ function supportsWebGL2(): boolean {
 export default function MapView({
   waypoints, routes, selected, vehicle, showRestrictions, showParking, onContext, pickMode, onPick, onSelectRoute, onStopMove, onStopDrop, onWaypointDrag, onRouteDrag, onWaypointRemove, keepView,
   zoneCountries, zoneAreas, drawMode, circleKm, onDrawDone, onDrawCancel, onRoutePreview,
-  crossings = [], crossStatus, focus, onPickCancel,
+  crossings = [], crossStatus, focus, onPickCancel, highlightSection = null, zoomSection = null,
 }: Props) {
   const crossMarkers = useRef<Marker[]>([]);
   const drawRef = useRef({ drawMode, circleKm, onDrawDone, onDrawCancel });
@@ -149,7 +154,7 @@ export default function MapView({
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
     map.on("load", () => {
-      for (const id of ["zones", "alt", "main", "toll", "ferry", "restr", "park", "drag", "handle", "draw"]) map.addSource(id, { type: "geojson", data: EMPTY });
+      for (const id of ["zones", "alt", "main", "toll", "ferry", "hl", "restr", "park", "drag", "handle", "draw"]) map.addSource(id, { type: "geojson", data: EMPTY });
       map.addLayer({ id: "zones-fill", type: "fill", source: "zones", paint: { "fill-color": "#dc2626", "fill-opacity": 0.1 } });
       map.addLayer({ id: "zones-line", type: "line", source: "zones", paint: { "line-color": "#dc2626", "line-width": 2, "line-dasharray": [2, 1.5], "line-opacity": 0.8 } });
       map.addLayer({ id: "alt-line", type: "line", source: "alt", layout: { "line-cap": "round", "line-join": "round" },
@@ -164,6 +169,10 @@ export default function MapView({
         paint: { "line-color": "#ffffff", "line-width": 7 } });
       map.addLayer({ id: "ferry-line", type: "line", source: "ferry", layout: { "line-cap": "round" },
         paint: { "line-color": "#0d9488", "line-width": 4, "line-dasharray": [1.4, 1.2] } });
+      map.addLayer({ id: "hl-case", type: "line", source: "hl", layout: { "line-cap": "round", "line-join": "round" },
+        paint: { "line-color": "#ffffff", "line-width": 12, "line-opacity": 0.9 } });
+      map.addLayer({ id: "hl-line", type: "line", source: "hl", layout: { "line-cap": "round", "line-join": "round" },
+        paint: { "line-color": "#f59e0b", "line-width": 7 } });
       map.addLayer({ id: "draw-fill", type: "fill", source: "draw", filter: ["==", "$type", "Polygon"], paint: { "fill-color": "#dc2626", "fill-opacity": 0.15 } });
       map.addLayer({ id: "draw-line", type: "line", source: "draw", paint: { "line-color": "#dc2626", "line-width": 2.5 } });
       map.addLayer({ id: "draw-pt", type: "circle", source: "draw", filter: ["==", "$type", "Point"], paint: { "circle-radius": 5, "circle-color": "#fff", "circle-stroke-color": "#dc2626", "circle-stroke-width": 2.5 } });
@@ -464,6 +473,61 @@ export default function MapView({
     set("ferry", sel ? { type: "FeatureCollection", features: (sel.ferries ?? []).map((fr) => ({ type: "Feature" as const, properties: {}, geometry: { type: "LineString" as const, coordinates: fr.geometry } })) } : EMPTY);
     set("toll", sel ? { type: "FeatureCollection", features: sel.tollGeometry.map((g) => ({ type: "Feature" as const, properties: {}, geometry: { type: "LineString" as const, coordinates: g } })) } : EMPTY);
   }, [routes, selected, ready, waypoints]);
+
+  // útszám-jelvények az útvonalon (HTML jelvények: a térkép-stílusban nincs betűkészlet) + kiemelés
+  const roadBadges = useRef<{ m: Marker; el: HTMLElement; km: number }[]>([]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    roadBadges.current.forEach((b) => b.m.remove());
+    roadBadges.current = [];
+    const sel = routes[selected];
+    if (!sel?.sections?.length) return;
+    const cum = cumulative(sel.geometry);
+    for (const s of sel.sections) {
+      if (s.cls === "ferry" || !s.ref || s.km < 6) continue;
+      const el = document.createElement("div");
+      el.textContent = s.label;
+      el.style.cssText = `pointer-events:none;font:700 11px system-ui;padding:1px 5px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.45);white-space:nowrap;${
+        s.cls === "motorway" ? "background:#1d4ed8;color:#fff;border:1.5px solid #fff"
+        : s.cls === "trunk" ? "background:#047857;color:#fff;border:1.5px solid #fff"
+        : "background:#fcd34d;color:#111827;border:1.5px solid #374151"}`;
+      const mid = pointAtFraction(sel.geometry, cum, (s.f0 + s.f1) / 2);
+      const m = new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat(mid).addTo(map);
+      roadBadges.current.push({ m, el, km: s.km });
+    }
+    const upd = () => {
+      const z = map.getZoom();
+      const minKm = z < 5.5 ? 80 : z < 7 ? 40 : z < 8.5 ? 18 : z < 10 ? 8 : 0;
+      for (const b of roadBadges.current) b.el.style.display = b.km >= minKm ? "" : "none";
+    };
+    upd();
+    map.on("zoom", upd);
+    return () => { map.off("zoom", upd); };
+  }, [routes, selected, ready]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const sel = routes[selected];
+    const s = highlightSection !== null ? sel?.sections?.[highlightSection] : undefined;
+    const data: GeoJSON.FeatureCollection = sel && s
+      ? { type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: sliceFraction(sel.geometry, cumulative(sel.geometry), s.f0, s.f1) } }] }
+      : EMPTY;
+    (map.getSource("hl") as GeoJSONSource | undefined)?.setData(data);
+  }, [routes, selected, ready, highlightSection]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const sel = routes[selected];
+    const s = zoomSection ? sel?.sections?.[zoomSection.i] : undefined;
+    if (!map || !ready || !sel || !s) return;
+    const pts = sliceFraction(sel.geometry, cumulative(sel.geometry), s.f0, s.f1);
+    const b = new maplibregl.LngLatBounds();
+    pts.forEach((c) => b.extend(c));
+    map.fitBounds(b, { padding: 70, maxZoom: 14, duration: 600 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomSection]);
 
   // fit bounds on new route set (húzás után a nézet marad)
   const lastFit = useRef<unknown>(null);

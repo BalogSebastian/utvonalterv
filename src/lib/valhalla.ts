@@ -22,6 +22,11 @@ export interface VManeuver {
   ferry?: boolean;
   begin_shape_index: number;
   end_shape_index: number;
+  sign?: {
+    exit_number_elements?: { text: string }[];
+    exit_toward_elements?: { text: string }[];
+    exit_branch_elements?: { text: string }[];
+  };
 }
 export interface VLeg {
   shape: string;
@@ -38,7 +43,10 @@ export interface VEdge {
   length: number; // km
   begin_shape_index: number;
   end_shape_index: number;
-  speed_limit?: number;
+  /** km/h, vagy "unlimited" (pl. német autópálya) */
+  speed_limit?: number | "unlimited";
+  /** a routing-szerver becsült sebessége (km/h) */
+  speed?: number;
   use?: string;
   names?: string[];
   tunnel?: boolean;
@@ -483,12 +491,13 @@ export async function traceEdges(
   leg: VLeg,
   v: Vehicle,
   o: RouteOptions,
+  mode: "edge_walk" | "walk_or_snap" = "edge_walk",
 ): Promise<{ shape: string; edges: VEdge[]; admins?: { country_code?: string }[] }> {
   const body = {
     encoded_polyline: leg.shape,
     costing: "truck",
     costing_options: truckCosting(v, o),
-    shape_match: "edge_walk",
+    shape_match: mode,
     filters: {
       attributes: [
         "shape",
@@ -497,6 +506,8 @@ export async function traceEdges(
         "edge.road_class",
         "edge.use",
         "edge.names",
+        "edge.speed",
+        "edge.speed_limit",
         "edge.tunnel",
         "edge.begin_shape_index",
         "edge.end_shape_index",

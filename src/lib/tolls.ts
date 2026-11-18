@@ -329,6 +329,70 @@ export function isTolledEdge(rule: TollRule, roadClass: string | undefined, osmT
   return !!roadClass && rule.classes.includes(roadClass);
 }
 
+/** egy út-él azonosításhoz szükséges adatok (Valhalla trace_attributes) */
+export interface EdgeFacts {
+  roadClass?: string;
+  /** OSM toll=yes (hiányos: DE / HU / CZ / PL főutakon sosem szerepel) */
+  osmToll: boolean;
+  names?: string[];
+  use?: string;
+  at?: [number, number];
+}
+
+const hasName = (f: EdgeFacts, re: RegExp) => !!f.names?.some((n) => re.test(n));
+/** nemzeti főút száma (1–2 jegyű): HU 3 / 4, CZ 35, SK 18, PL 92 – a 3 jegyű a másodrendű (nem díjköteles) */
+const NATIONAL_NO = /^\d{1,2}[a-z]?$/;
+/** gyorsforgalmi út jelzése: M0, D1, R1, A4, S8 */
+const EXPRESS_REF = /^[ADMRS] ?\d{1,3}[a-z]?$/;
+/** spanyol díjas autópályák (a Valhalla-adatból a toll jelölés hiányzik) */
+const ES_TOLL_REF = /^(AP-?(9|8|68|66|36|41|46|6|61|51)|R-?[2-5])$/;
+const IT_FREE_REF = /^A ?(2|19)$/;
+
+/**
+ * Díjköteles-e az él az adott országban. Az OSM `toll` jelölés nem megbízható (a német, magyar, cseh,
+ * lengyel utakon egyáltalán nincs), ezért az útosztály mellett az útszámot is nézzük:
+ *  - DE: autópálya + minden Bundesstraße (B), a Landesstraße / városi utca nem
+ *  - AT: csak az A / S ASFINAG-hálózat (a B utak nem)
+ *  - HU / CZ / SK / PL: gyorsforgalmi út + számozott országos főút; számozatlan városi utca nem
+ *  - ES: az ismert díjas AP / R autópályák (a jelölés hiányos)
+ *  - IT: az ingyenes A2 (Salerno–Reggio) és A19 kivételével az autópályák
+ */
+export function isTolledFor(cc: string, rule: TollRule, f: EdgeFacts): boolean {
+  if (rule.fixedFn && !rule.rate && !rule.rates) return false;
+  if (rule.allRoads) return true;
+  const rc = f.roadClass;
+  switch (cc) {
+    case "DE":
+      if (rc === "motorway") return true;
+      return ["trunk", "primary", "secondary", "tertiary"].includes(rc ?? "") && hasName(f, /^B ?\d{1,3}[a-z]?$/);
+    case "AT":
+      if (rc === "motorway") return true;
+      return (rc === "trunk" || f.osmToll) && hasName(f, /^[AS] ?\d{1,2}$/);
+    case "HU": case "CZ": case "SK": case "PL":
+      if (rc === "motorway") return true;
+      if (!rc || !rule.classes.includes(rc)) return f.osmToll && hasName(f, EXPRESS_REF);
+      return hasName(f, EXPRESS_REF) || hasName(f, NATIONAL_NO) || f.osmToll;
+    case "ES":
+      if (f.osmToll) return true;
+      if (rc !== "motorway" && rc !== "trunk") return false;
+      if (hasName(f, ES_TOLL_REF)) return true;
+      // AP-7: csak Tarragonától északra (La Jonquera–Barcelona–Tarragona) és a Costa del Solon díjas
+      return hasName(f, /^AP-?7$/) && !!f.at && (f.at[1] > 41.0 || f.at[1] < 36.8);
+    case "IT":
+      if (f.osmToll) return true;
+      return rc === "motorway" && !hasName(f, IT_FREE_REF);
+    default:
+      return isTolledEdge(rule, rc, f.osmToll);
+  }
+}
+
+/** az útdíj-tarifa osztálya: a gyorsforgalmi számú utak (M0, D1, R1, S8) autópálya-díjat fizetnek */
+export function rateClassFor(cc: string, f: EdgeFacts): string | undefined {
+  if (["HU", "CZ", "SK", "PL"].includes(cc) && f.roadClass !== "motorway" && hasName(f, EXPRESS_REF)) return "motorway";
+  if (["HU", "CZ", "SK", "PL"].includes(cc) && f.roadClass === "trunk" && !hasName(f, EXPRESS_REF)) return "primary";
+  return f.roadClass;
+}
+
 /**
  * EUR / km az adott országra, járműre és útosztályra. 0 ha nem km-alapú.
  * @param eurHuf a forintos tarifák átváltásához

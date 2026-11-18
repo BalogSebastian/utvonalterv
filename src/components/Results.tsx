@@ -5,6 +5,7 @@ import { COUNTRY_NAMES } from "@/lib/country-names";
 import { dt, dur, eur, eur2, flag, huf, km } from "@/lib/format";
 import type { CostInputs, RouteResult, Waypoint } from "@/lib/types";
 import DriverSend from "./DriverSend";
+import RouteTimeline from "./RouteTimeline";
 
 interface Props {
   routes: RouteResult[];
@@ -19,6 +20,10 @@ interface Props {
   parkStatus: string;
   waypoints: Waypoint[];
   departure: string;
+  /** útszakasz kiemelése a térképen (hover) / ráközelítés (kattintás) */
+  activeSection: number | null;
+  onSectionHover: (i: number | null) => void;
+  onSectionFocus: (i: number) => void;
 }
 
 function download(name: string, text: string, type: string) {
@@ -52,6 +57,9 @@ function csv(r: RouteResult, c: CostInputs) {
     ...r.specials.filter((x) => x.modelled).map((x) => [x.name, x.km.toFixed(1), "", "", x.fee.toFixed(2)]),
     ...r.ferries.map((f) => [`${f.name} (${f.from} → ${f.to})`, f.km.toFixed(1), "", "", f.priceEur.toFixed(2)]),
     [],
+    ["Út", "Ország", "Kezdés", "Vége", "Km", "Vezetés (perc)", "Ø km/h", "Útdíj EUR"],
+    ...(r.sections ?? []).map((x) => [x.label, x.country, x.start.replace("T", " "), x.end.replace("T", " "), x.km.toFixed(1), (x.h * 60).toFixed(0), x.speed.toFixed(0), x.tollEur.toFixed(2)]),
+    [],
     ["Megálló", "Idő", "Km", "Hely"],
     ...r.stops.map((st) => [st.kind, st.time.replace("T", " "), st.km.toFixed(0), st.place ?? ""]),
     ["Érkezés", r.schedule.arrival.replace("T", " "), r.distanceKm.toFixed(0), ""],
@@ -61,7 +69,7 @@ function csv(r: RouteResult, c: CostInputs) {
 
 const KIND: Record<string, string> = { break: "☕ 45 perc szünet", rest: "🌙 Napi pihenő", wait: "⏳ Várakozás", ferry: "⛴ Komp / vasút" };
 
-export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited, onSnapParking, parkStatus, waypoints, departure }: Props) {
+export default function Results({ routes, selected, onSelect, costs, onAddStop, onRemoveStop, onResetStops, edited, onSnapParking, parkStatus, waypoints, departure, activeSection, onSectionHover, onSectionFocus }: Props) {
   const [showSteps, setShowSteps] = useState(false);
   const [margin, setMargin] = useState(15);
   const [roundTrip, setRoundTrip] = useState(false);
@@ -151,6 +159,8 @@ export default function Results({ routes, selected, onSelect, costs, onAddStop, 
         </dl>
         <div className="mt-2 text-xs text-slate-400">Üzemanyag: {Math.round(r.fuelLiters)} liter · {r.schedule.days} naptári nap (napi költségek) · útdíj nettó, ÁFA nélkül</div>
       </section>
+
+      <RouteTimeline route={r} onHover={onSectionHover} onFocus={onSectionFocus} active={activeSection} />
 
       <section className="card">
         <h3 className="h3">Ajánlati ár számítás</h3>

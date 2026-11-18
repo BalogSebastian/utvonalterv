@@ -264,6 +264,48 @@ export interface RouteResult {
   ferry: boolean;
   tollAccuracy: "edge" | "maneuver";
   maneuvers: { text: string; km: number; min: number; street?: string }[];
+  /** az útvonal útszakaszokra bontva: melyik úton, mikor, hány km (a térképes kiemeléshez f0/f1) */
+  sections: RoadSection[];
+}
+
+export type RoadClassKey = "motorway" | "trunk" | "primary" | "secondary" | "minor" | "local" | "ferry";
+
+/** Egy összefüggő útszakasz ugyanazon az úton (pl. „M1”, „A4”, „B 12”) */
+export interface RoadSection {
+  /** útszám (M1, A4, B 12, 6…), ha van */
+  ref?: string;
+  /** európai útszámok (E 60…) */
+  euro?: string[];
+  /** utcanév / út neve */
+  name?: string;
+  /** megjelenített cím: útszám vagy utcanév */
+  label: string;
+  cls: RoadClassKey;
+  country: string;
+  /** az útvonal mentén megtett km a szakasz elején */
+  startKm: number;
+  km: number;
+  /** geometriai arány az útvonal mentén (0..1) */
+  f0: number;
+  f1: number;
+  /** vezetési idő (óra, kamionos sebességmodell) */
+  h: number;
+  /** modellezett átlagsebesség km/h */
+  speed: number;
+  /** a leggyakoribb kihelyezett sebességkorlát km/h */
+  limit?: number;
+  tollKm: number;
+  /** a szakasz útdíja (EUR) */
+  tollEur: number;
+  /** a táblák szerinti irány (a szakaszon látható első útirány-tábla) */
+  toward?: string;
+  /** lehajtó: sorszám és irány a szakasz végén / közben */
+  exit?: string;
+  /** összevont kisebb utak: a leghosszabb utcanevek */
+  via?: string[];
+  /** becsült áthaladás kezdete / vége (ISO, helyi indulási idő alapján; a menetrend tölti ki) */
+  start: string;
+  end: string;
 }
 
 export interface CrossingUse {
